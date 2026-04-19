@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 运行生成（可删此行以把评测结果一并备份）
+results_output.csv
