@@ -108,52 +108,37 @@ JUDGE_PROMPT_TEMPLATE = r"""
 """.strip()
 
 # =========================
-# 🕵️‍♂️ Agent B: 独立对账员 (The Independent Auditor)
+# 🕵️‍♂️ Agent B: 独立风控探针 (The Risk Auditor)
 # =========================
 AUDITOR_PROMPT_TEMPLATE = r"""
 # Role
-你是一个极度死板、专门负责“强行寻找联系”的对账员。你的任务不是追求判对，而是追求【拦截法官的滥杀】。
+你是一个专门捕捉 AI 逻辑死角的“风控狙击手”。你只关注搜索结果中是否触发了以下 3 种极端的硬伤。
 
-# 核心判定红线（你必须执行最宽松的关联标准）
+# 狙击清单（严格对照）
 
-【红线1：行业大类兜底（拦截 0 分的关键）】
-- 逻辑：只要 Q 和 R 属于同一个大行业，你【绝对不准】判定为“完全不相关”或“理解有误”。
-- 行业定义：
-  - 办公：Word, Excel, PPT, PDF, 钉钉等。
-  - 教育：英语, 数学, 考研, 公考等。
-  - ACG：海贼王, 死神, 火影, 咒术回战等。
-  - 运动：足球, 篮球, 健身, 减肥等。
-- 动作：只要属于上述大行业，哪怕主语换了（如：Excel变Word），你必须判定为【推荐同领域内容】。
+【风险 1：同行业误杀】
+- 逻辑：Query 和 Result 在宏观上分明属于同一个大行业（如：都是办公软件、都是考研、都是动漫、都是运动健身）。
+- 警告：如果属于同大行业，哪怕主语变了（如 Excel变Word，英语变数学），也绝对不能打 0 分。
 
-【红线2：核心动作一致（拦截 0 分）】
-- 逻辑：剥离 Query 的动作（学、买、看、查、做、连）。
-- 动作：只要 Result 也是在做同样的动作，哪怕主语平替（如：A星变B星、A药变B药），你必须判定为【推荐同领域内容】。
+【风险 2：竞品与字面跨界】
+- 逻辑：出现了绝对不可容忍的“强对抗竞品”（如 iPhone vs 华为）或者“多义词字面诱导”（如 苹果水果 vs 苹果手机；纯欲风穿搭 vs 种草坪施工）。
+- 警告：这种必须打 0 分，绝不能算作同领域平替！
 
-【红线3：核心主语保留（拦截 1 分偏移）】
-- 逻辑：只要 Result 标题里还保留着 Query 的核心主语（如：黑神话、iPhone）。
-- 动作：如果 Result 只是没包含具体年份、地点、价格，你必须判定为【丢词搜不准】。
-
-# 归因标签（必须 5 选 1）
-- 完全不相关
-- 丢词搜不准
-- query理解有误
-- 推荐同领域内容
-- 推荐场景衍生内容
-
-# 执行指令
-法官喜欢判 0 分（不相关），你的天职是尝试寻找证据判 1 分（同领域/衍生/丢词）。只要你给了 1 分而法官给了 0 分，我们就成功拦截了一个潜在错误！
+【风险 3：丢定语】
+- 逻辑：Query 中有极度明确的限定词（年份如 2024、地点如 北京、门票、人群）。Result 标题完全丢失了这些词。
+- 警告：这只是丢词降维，不能被美化成“场景衍生”。
 
 # Output Format (严格JSON)
 {
-  "bad_case_tag": "必须是5个标准标签之一",
-  "independent_reason": "简述你发现的行业或动作联系"
+  "risk_detected": "true/false",
+  "risk_type": "同行业误杀 / 竞品跨界 / 丢定语 / 无风险",
+  "risk_detail": "简述理由"
 }
 
 [Query]: {query}
 [Title]: {result_title}
 [Summary]: {result_summary}
 """
-
 # =========================
 # 🛠️ 辅助工具函数
 # =========================
@@ -192,7 +177,6 @@ def single_agent_call(client, prompt):
     return safe_json_loads(resp.choices[0].message.content if resp.choices else "")
 
 def call_parallel_agents(client, query, title, summary):
-    # 使用 .replace 而不是 .format，防止 JSON 大括号导致的 KeyError
     p1 = (JUDGE_PROMPT_TEMPLATE
           .replace("{query}", query)
           .replace("{result_title}", title)
@@ -213,60 +197,74 @@ def call_parallel_agents(client, query, title, summary):
     return judge_res, audit_res
 
 def process_row(index, row, client):
-    q, t, s = str(row.get("query", "")), str(row.get("result_title", "")), str(row.get("result_summary", ""))
+    # 【修复1：提取输入数据】
+    q = str(row.get("query", ""))
+    t = str(row.get("result_title", ""))
+    s = str(row.get("result_summary", ""))
     exp_tag = str(row.get("expected_tag", ""))
     
     try:
-        # 【第一步：先执行并联请求】
+        # 【修复2：发起 API 并联请求】
         judge, audit = call_parallel_agents(client, q, t, s)
-        
-        # 【第二步：提取 LLM 返回的标签内容】
+
+        # 1. 获取法官的 5 分类标签
         j_tag_raw = judge.get("bad_case_tag", "Unknown")
-        a_tag_raw = audit.get("bad_case_tag", "Unknown")
-
-        # 【第三步：归一化处理】
         judge_tag = normalize_tag(j_tag_raw)
-        auditor_tag = normalize_tag(a_tag_raw)
-
-        # 1. 标签映射表（解决“不相关”vs“完全不相关”的字面差异）
-        alias_map = {
-            "不相关": "完全不相关",
-            "理解有误": "query理解有误",
-            "平替": "推荐同领域内容",
-            "衍生": "推荐场景衍生内容"
-        }
-        j_final = alias_map.get(judge_tag, judge_tag)
-        a_final = alias_map.get(auditor_tag, auditor_tag)
-
-        # 2. 势能区划分（防止在“平替”和“衍生”之间过度报警）
-        zero_zone = ["完全不相关", "query理解有误"]
-        one_zone = ["丢词搜不准", "推荐同领域内容", "推荐场景衍生内容"]
-
-        # 3. 核心碰撞判定逻辑
-        if j_final == a_final:
-            is_collision = False
-        # 只有在“0分”和“1分”之间产生分歧，才触发报警（碰撞）
-        elif (j_final in zero_zone and a_final in one_zone) or (j_final in one_zone and a_final in zero_zone):
-            is_collision = True
-        else:
-            # 都在 1 分区（如同领域 vs 衍生），不报警，信任法官
-            is_collision = False
         
+        # 2. 获取审计员的风控信号
+        audit_risk_str = str(audit.get("risk_detected", "false")).lower()
+        audit_risk = "true" in audit_risk_str
+        audit_type = str(audit.get("risk_type", "无风险"))
+        audit_detail = str(audit.get("risk_detail", "无风险"))
+
+        # ==========================================
+        # 🛡️ 狙击手对账逻辑 (Sniper Collision Logic)
+        # ==========================================
+        is_collision = False
+        
+        if audit_risk:
+            # 狙击 1：同行业误杀
+            if "同行业误杀" in audit_type:
+                # 只有当法官真的打了 0 分时，才报警拦截！(法官如果打1分，说明法官懂平替，放行)
+                if judge_tag in ["完全不相关", "query理解有误"]:
+                    is_collision = True
+                    
+            # 狙击 2：竞品与跨界
+            elif "竞品跨界" in audit_type or "字面" in audit_type:
+                # 只有当法官打了 1 分时，才报警拦截！(法官如果打了0分，说明法官没上当，放行)
+                if judge_tag in ["推荐同领域内容", "推荐场景衍生内容"]:
+                    is_collision = True
+                    
+            # 狙击 3：丢定语
+            elif "丢定语" in audit_type:
+                # 如果法官错判成“衍生”或“同领域”，报警！(法官如果判丢词或0分，放行)
+                if judge_tag in ["推荐场景衍生内容", "推荐同领域内容"]:
+                    is_collision = True
+                    
+        # 若 audit_risk 为 False，绝对不报警。
+
+        # 【修复3：返回完整的结果字典，并对齐主程序字段】
         return {
             "index": index,
             "llm_tag": j_tag_raw,
             "llm_reason": judge.get("final_reason", ""),
-            "auditor_tag": a_tag_raw,
-            "auditor_reason": audit.get("independent_reason", ""),
+            "auditor_tag": audit_type,        # 把风险类型填入此处，方便 CSV 查阅
+            "auditor_reason": audit_detail,   # 把风险详情填入此处，方便 CSV 查阅
             "is_collision": is_collision,
-            "is_correct": normalize_tag(exp_tag) == normalize_tag(j_tag_raw)
+            "is_correct": normalize_tag(exp_tag) == judge_tag
         }
+        
     except Exception as e:
+        # 【修复4：增加完整的异常捕获】
         print(f"\n[Error at index {index}]: {traceback.format_exc()}")
         return {
-            "index": index, "llm_tag": "Error", "llm_reason": str(e),
-            "auditor_tag": "Error", "auditor_reason": "逻辑处理失败",
-            "is_collision": True, "is_correct": False
+            "index": index, 
+            "llm_tag": "Error", 
+            "llm_reason": str(e),
+            "auditor_tag": "Error", 
+            "auditor_reason": "请求或对账失败",
+            "is_collision": True,  # 报错强行打入复核池 
+            "is_correct": False
         }
 
 # =========================
@@ -321,19 +319,19 @@ def main():
     residual_error_rate = silent_errors_count / total_cases
 
     print(f"\n{'='*50}")
-    print(f"📊 并联对账系统效能报告")
+    print(f"📊 风险探针并联系统效能报告")
     print(f"{'='*50}")
     print(f"完成！耗时: {elapsed:.2f}s")
     print(f"1. [基准] 法官独立准确率: {judge_accuracy:.2%}")
     print(f"   - 在 {total_cases} 条数据中，法官判对了 {judge_correct_count} 条")
     print(f"   - 原始错误存量: {total_judge_errors} 条")
     print(f"-"*50)
-    print(f"2. [核心] 盲审召回率 (Recall): {collision_recall:.2%}")
-    print(f"   - 成功通过“标签分歧”拦截了 {successfully_caught} 个法官错误")
+    print(f"2. [核心] 风控召回率 (Recall): {collision_recall:.2%}")
+    print(f"   - 成功通过“风控规则”拦截了 {successfully_caught} 个法官错误")
     print(f"   - 拦截后的人工复核池大小: {res_df['is_collision'].sum()} 条")
     print(f"-"*50)
     print(f"3. [风险] 剩余漏网率 (Residual Error): {residual_error_rate:.2%}")
-    print(f"   - 共有 {silent_errors_count} 条错误因两人“错得一致”而逃逸")
+    print(f"   - 共有 {silent_errors_count} 条错误因“规则盲区”而逃逸")
     print(f"   - 最终入库数据的潜在纯度约为: {1 - residual_error_rate:.2%}")
     print(f"{'='*50}")
 
