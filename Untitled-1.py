@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-离线批量评估搜索相关性脚本（V6 终极并发+任务一致性版）
-- 采用多线程并发架构
-- 引入 JTBD (用户任务) 决策树 Prompt
-- 严格校验 JSON Schema
-"""
-
 import json
 import os
 import re
@@ -24,20 +17,21 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # =========================
 # ⚙️ 核心配置区
 # =========================
-API_KEY = (os.environ.get("DEEPSEEK_API_KEY") or "你的API_KEY填写在这里").strip()
+API_KEY = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
 BASE_URL = "https://api.deepseek.com"
-MODEL_NAME = "deepseek-chat"  
+MODEL_NAME = "deepseek-chat"
 _SCRIPT_DIR = Path(__file__).resolve().parent
 INPUT_CSV = str(_SCRIPT_DIR / "test_cases.csv")
-OUTPUT_CSV = str(_SCRIPT_DIR / "results_output.csv")
+OUTPUT_CSV = str(_SCRIPT_DIR / "full_results_output.csv")
+REVIEW_CSV = str(_SCRIPT_DIR / "human_review_needed.csv")  # 导出需人工复核的 case
 
-REQUEST_TIMEOUT = 60  
-MAX_WORKERS = 10  # 并发线程数
+REQUEST_TIMEOUT = 60
+MAX_WORKERS = 20
 
 # =========================
-# 🧠 V6 终极业务对齐 Prompt
+# 🧠 Agent A: 原始 V6 法官 (The Judge)
 # =========================
-PROMPT_TEMPLATE = r"""
+JUDGE_PROMPT_TEMPLATE = r"""
 # Role
 你是一个极其严谨的搜索质量策略专家。你的任务是诊断搜索 Bad Case，判断其"相关性"缺陷的类型。
 
@@ -77,11 +71,13 @@ PROMPT_TEMPLATE = r"""
   - 判例6：搜“周生如故结局” → 给“周生如故幕后花絮”。（诉求：从正片结局 偏移到了 幕后娱乐。判定：场景衍生）
   - 判例7：搜“王者荣耀妲己皮肤” → 给“英雄联盟妲己角色解析”。（诉求：从看皮肤外观 偏移到了 解析战斗技能与游戏对比。判定：场景衍生）
   - 判例8：搜“泰坦尼克号主题曲” → 给“泰坦尼克号特效技术”。（诉求：从听音乐 偏移到了 看技术解析。判定：场景衍生）
-
-【第三步：实体缺失检查】
-若核心实体未被替换为兄弟实体，核心诉求也未偏离，仅仅是丢失了具体的限制词（如年份2024、特定型号）：
-- 【0分：丢词搜不准】
-（注：2024年跨年 变成 2023年跨年，属于丢掉了2024的限制词，判为丢词搜不准）
+  
+【第三步：修饰词丢失检查】
+- 类别C【丢词搜不准（纵向降维）】：
+  定义：Query 的【核心主语】没有发生横向替换，用户的【动作】也没有偏移，仅仅是丢失了修饰该主语的【具体限制词/定语】（如：年份、型号、特定版本、适用人群）。
+  💡 判例1：2024跨年 变 2023跨年（丢了正确年份）。
+  💡 判例2：婴儿浴巾 变 家用成人浴巾（丢了“婴儿”这个适用人群限制词）。
+  💡 判例3：iPhone 15 Pro 变 iPhone 15（丢了“Pro”这个型号限制词）。
 
 =========================================
 # 归因标准字典（仅限以下5选1）
@@ -92,7 +88,7 @@ PROMPT_TEMPLATE = r"""
 - 推荐场景衍生内容
 
 =========================================
-# Output Format (严格JSON，请确保 key 名称一致)
+# Output Format (严格JSON)
 {
   "step1_domain": "宏观领域判断结果",
   "step2_core_entity": "Query核心实体 vs Result核心实体",
@@ -111,109 +107,240 @@ PROMPT_TEMPLATE = r"""
 """.strip()
 
 # =========================
-# 🛠️ 辅助函数
+# 🧠 Agent B: 审计专家 (The Auditor)
 # =========================
-def build_client() -> OpenAI:
-    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
+AUDITOR_PROMPT_TEMPLATE = r"""
+# Role
+你是一个极度死板、铁面无私的搜索质量合规质检员。你的唯一工作是执行“字面逻辑核对”和“常识常理纠偏”。严禁过度解读用户的潜在意图。
+
+# 输入信息
+[Query]: {query}
+[Result]: {result_title}
+[法官判定标签]: {judge_tag}
+[法官判定理由]: {judge_reason}
+
+# 合规审查清单（严格按顺序执行）
+
+【红线1：法官是否在“跨界领域”上撒谎？】（抓漏网之鱼）
+- 检查动作：如果法官的标签是【完全不相关】或【query理解有误】，你必须用自己的常识看一眼 Query 和 Result。
+- 触发条件：如果它们明明属于同一个大众认知的行业/圈层（如：iPhone与华为同属手机、考研英语与数学同属教育、海贼王与死神同属动漫），法官却说“完全跨界无交集/完全不相关”，这是法官在撒谎！
+- 判决：必须质疑 (Low)，理由写：“同属XX领域，法官误判为完全不相关”。
+
+【红线2：法官的“理由”和“标签”是否字面冲突？】（抓逻辑断裂）
+- 检查动作：只看文字表面，不加主观理解。
+- 触发条件 A：法官理由写了“任务/诉求/形式/动作发生了偏移”，但最后给的标签是【同领域】。
+- 触发条件 B：法官理由写了“仅仅是对象/实体发生了同级替换”，但最后给的标签是【场景衍生】。
+- 判决：必须质疑 (Medium)，理由写：“理由与标签字面冲突”。
+
+【红线3：防杠精绝对纪律】（防误伤）
+- 只要不触发红线1和红线2，你【绝对禁止】去质疑法官的分类。
+- 严禁自行脑补：“我认为猫看病和狗洗澡意图不同”、“我认为这算丢词”。
+- 只要法官的文字逻辑是自洽的，哪怕你觉得有点牵强，也必须无条件放行！
+
+# Output Format (严格JSON)
+{
+  "confidence_level": "High/Medium/Low",
+  "uncertainty_reason": "只填触发了哪条红线及简述 / 未触发红线填'无'",
+  "is_audit_agree": "true/false"
+}
+"""
+# =========================
+# 辅助函数
+# =========================
+def read_csv_with_fallback(path: str) -> pd.DataFrame:
+    # 依次尝试：带签名的UTF8 -> 中文GBK -> 标准UTF8 -> 扩展中文
+    for enc in ["utf-8-sig", "gbk", "utf-8", "gb18030"]:
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"无法读取文件 {path}，请确认文件格式是否正确。")
+
 
 def normalize_text(s: Any) -> str:
-    if s is None: return ""
-    s = str(s).strip()
-    s = re.sub(r"\s+", "", s)
-    return s.lower()
+    if s is None:
+        return ""
+    t = str(s).strip()
+    t = re.sub(r"\s+", "", t)
+    return t.lower()
+
 
 def is_tag_match(expected_tag: str, llm_tag: str) -> bool:
     exp, pred = normalize_text(expected_tag), normalize_text(llm_tag)
-    if not exp or not pred: return False
+    if not exp or not pred:
+        return False
     return exp == pred or exp in pred or pred in exp
+
+
+# =========================
+# ⚙️ 并发流水线逻辑
+# =========================
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
     text = (text or "").strip()
-    try: return json.loads(text)
-    except json.JSONDecodeError: pass
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+    return {}
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match:
-        try: return json.loads(match.group(0))
-        except json.JSONDecodeError: pass
-    
-    try: return json.loads(text.replace("'", '"'))
-    except json.JSONDecodeError: return {}
-
-def read_csv_with_fallback(path: str) -> pd.DataFrame:
-    for enc in ["utf-8", "utf-8-sig", "gb18030", "gbk"]:
-        try: return pd.read_csv(path, encoding=enc)
-        except UnicodeDecodeError: continue
-    raise ValueError(f"无法读取 CSV 文件: {path}")
-
-# =========================
-# ⚙️ 核心引擎执行层
-# =========================
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type(Exception),
-    reraise=True,
-)
-def call_llm_for_row(client: OpenAI, query: str, result_title: str, result_summary: str) -> Tuple[str, str, Dict[str, Any]]:
-    prompt = PROMPT_TEMPLATE.replace("{query}", str(query)).replace("{result_title}", str(result_title)).replace("{result_summary}", str(result_summary))
-
-    resp = client.chat.completions.create(
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+def call_agents(client: OpenAI, query: str, title: str, summary: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    p1 = (
+        JUDGE_PROMPT_TEMPLATE.replace("{query}", query)
+        .replace("{result_title}", title)
+        .replace("{result_summary}", summary)
+    )
+    resp1 = client.chat.completions.create(
         model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "你是一个严谨的搜索质量诊断助手。请严格输出 JSON。"},
-            {"role": "user", "content": prompt},
-        ],
+        messages=[{"role": "user", "content": p1}],
         temperature=0,
         response_format={"type": "json_object"},
         timeout=REQUEST_TIMEOUT,
     )
+    raw1 = resp1.choices[0].message.content if resp1.choices else ""
+    judge_res = safe_json_loads(raw1)
 
-    data = safe_json_loads(resp.choices[0].message.content if resp.choices else "")
-    return str(data.get("bad_case_tag", "")).strip(), str(data.get("final_reason", "")).strip(), data
+    p2 = (
+        AUDITOR_PROMPT_TEMPLATE.replace("{query}", query)
+        .replace("{result_title}", title)
+        .replace("{judge_tag}", str(judge_res.get("bad_case_tag", "")))
+        .replace("{judge_reason}", str(judge_res.get("final_reason", "")))
+    )
+    resp2 = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": p2}],
+        temperature=0,
+        response_format={"type": "json_object"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    raw2 = resp2.choices[0].message.content if resp2.choices else ""
+    audit_res = safe_json_loads(raw2)
 
-def process_single_row(index: int, row: dict, client: OpenAI) -> tuple:
+    return judge_res, audit_res
+
+def process_single_row(index, row, client):
+    q, t, s = str(row.get("query", "")), str(row.get("result_title", "")), str(row.get("result_summary", ""))
     try:
-        pred_tag, pred_reason, _ = call_llm_for_row(client, row.get("query", ""), row.get("result_title", ""), row.get("result_summary", ""))
+        judge, audit = call_agents(client, q, t, s)
+        pred_tag = str(judge.get("bad_case_tag", "")).strip()
+        exp_tag = str(row.get("expected_tag", ""))
+        return {
+            "index": index,
+            "llm_tag": pred_tag,
+            "llm_reason": judge.get("final_reason", ""),
+            "confidence_level": str(audit.get("confidence_level", "High")),
+            "uncertainty_reason": str(audit.get("uncertainty_reason", "无")),
+            "is_audit_agree": str(audit.get("is_audit_agree", "true")),
+            "is_correct": is_tag_match(exp_tag, pred_tag),
+        }
     except Exception as e:
-        pred_tag, pred_reason = "", f"API调用失败: {e}"
-    
-    correct = is_tag_match(str(row.get("expected_tag", "")), pred_tag)
-    return index, pred_tag, pred_reason, correct
+        # 修复了异常字典漏字段导致 Pandas KeyError 的 BUG
+        return {
+            "index": index, 
+            "llm_tag": "Error", 
+            "llm_reason": "程序执行异常",
+            "confidence_level": "Low", # 遇到错误强行标记为 Low 以便人工排查
+            "uncertainty_reason": f"代码报错: {str(e)}",
+            "is_audit_agree": "false",
+            "is_correct": False
+        }
 
 # =========================
-# 🏁 主程序入口
+# 🏁 主程序
 # =========================
 def main():
-    if not API_KEY or API_KEY == "你的API_KEY填写在这里":
-        print("⚠️ 报错：请在代码最上方配置你的 API_KEY")
+    if not API_KEY:
+        print("[错误] 请设置环境变量 DEEPSEEK_API_KEY 后重试。")
         return
 
     df = read_csv_with_fallback(INPUT_CSV)
-    client = build_client()
+    required = ["query", "result_title", "result_summary", "expected_tag"]
+    miss = [c for c in required if c not in df.columns]
+    if miss:
+        raise ValueError(f"输入 CSV 缺少列: {miss}")
 
-    llm_tags, llm_reasons, is_correct_list = [""] * len(df), [""] * len(df), [False] * len(df)
+    client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    results: list = [None] * len(df)
 
-    print(f"\n🚀 开始执行 V6 终极引擎并发诊断 (并发数: {MAX_WORKERS})...")
+    print("\n[开始] 双 Agent 串联评估 (V6 Judge + Auditor)...")
     start_time = time.time()
-    
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        records = df.to_dict('records')
-        futures = [executor.submit(process_single_row, i, record, client) for i, record in enumerate(records)]
-        
-        for future in tqdm(as_completed(futures), total=len(df), desc="评估进度"):
-            idx, pred_tag, pred_reason, correct = future.result()
-            llm_tags[idx], llm_reasons[idx], is_correct_list[idx] = pred_tag, pred_reason, correct
+        records = df.to_dict("records")
+        futures = {executor.submit(process_single_row, i, r, client) for i, r in enumerate(records)}
+        for future in tqdm(as_completed(futures), total=len(df), desc="进度"):
+            res = future.result()
+            results[res["index"]] = res
 
-    df["llm_tag"], df["llm_reason"], df["is_correct"] = llm_tags, llm_reasons, is_correct_list
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    if any(r is None for r in results):
+        raise RuntimeError("部分行未返回结果，请检查并发与异常逻辑。")
 
-    accuracy = (sum(is_correct_list) / len(is_correct_list)) if is_correct_list else 0.0
+    res_df = df.copy().reset_index(drop=True)
+    for col in (
+        "llm_tag",
+        "llm_reason",
+        "confidence_level",
+        "uncertainty_reason",
+        "is_audit_agree",
+        "is_correct",
+    ):
+        res_df[col] = [results[i][col] for i in range(len(df))]
+
+    res_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+    conf_norm = res_df["confidence_level"].astype(str).str.strip().str.lower()
+    audit_disagree = res_df["is_audit_agree"].astype(str).str.lower() == "false"
+    review_needed = res_df[(conf_norm != "high") | audit_disagree]
+    review_needed.to_csv(REVIEW_CSV, index=False, encoding="utf-8-sig")
+
+    # =========================
+    # 📈 新增：多维高阶评估指标
+    # =========================
+    total_cases = len(res_df)
     
-    print("\n✅ 诊断圆满完成！")
-    print(f"⏱️ 耗时: {time.time() - start_time:.2f} 秒")
-    print(f"📊 最终对齐率 (Accuracy): {accuracy:.2%} ({sum(is_correct_list)}/{len(is_correct_list)})")
-    print(f"📁 详细结果已保存至: {OUTPUT_CSV}")
+    # 1. 法官指标 (Judge Metrics)
+    judge_correct = res_df['is_correct'].sum()
+    judge_accuracy = judge_correct / total_cases if total_cases > 0 else 0
+    judge_wrong_total = total_cases - judge_correct
+
+    # 2. 审计员指标 (Auditor Metrics)
+    flagged_total = len(review_needed) # 审计员举手的总次数
+    
+    # 有效拦截：法官判错了，且审计员成功举手了 (True Positive)
+    true_interception = len(review_needed[review_needed['is_correct'] == False])
+    
+    # 误伤：法官其实判对了，但审计员觉得有问题 (False Positive)
+    false_interception = len(review_needed[review_needed['is_correct'] == True])
+    
+    # 漏网之鱼：法官判错了，但审计员没发现 (False Negative)
+    missed_errors = judge_wrong_total - true_interception
+
+    sep = "=" * 40
+    elapsed = time.time() - start_time
+    print(f"\n[完成] 耗时: {elapsed:.2f} 秒")
+    print(sep)
+    print(" [Agent A 法官]")
+    print(f"    - 法官对齐率: {judge_accuracy:.2%} ({judge_correct}/{total_cases})")
+    print(f"    - 法官判错数: {judge_wrong_total}")
+    print(sep)
+    print(" [Agent B 审计]")
+    print(f"    - 质疑条数: {flagged_total}")
+    tp_rate = (true_interception / judge_wrong_total) if judge_wrong_total else 0.0
+    fp_rate = (false_interception / judge_correct) if judge_correct else 0.0
+    print(f"    - 错案中被标记: {tp_rate:.2%} ({true_interception}/{judge_wrong_total})")
+    print(f"    - 对案中被误标: {fp_rate:.2%} ({false_interception}/{judge_correct})")
+    print(f"    - 错案未标记数: {missed_errors}")
+    print(sep)
+    print(f" 待复核列表: {REVIEW_CSV} (共 {flagged_total} 条)")
+
+    accuracy = float(res_df["is_correct"].mean())
+    print(f"\n全量对齐率: {accuracy:.2%}")
+    print(f"待复核导出: {REVIEW_CSV} (共 {len(review_needed)} 条)")
 
 if __name__ == "__main__":
     main()

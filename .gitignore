@@ -13,5 +13,7 @@ venv/
 .vscode/
 *.swp
 
-# 运行生成（可删此行以把评测结果一并备份）
+# 运行生成（若要一并备份到 GitHub，可删掉下面几行后再 git add）
 results_output.csv
+full_results_output.csv
+human_review_needed.csv
