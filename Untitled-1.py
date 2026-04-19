@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import traceback
 from pathlib import Path
 from typing import Dict, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from openai import OpenAI
 from tqdm import tqdm
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # =========================
 # ⚙️ 核心配置区
@@ -23,13 +24,13 @@ MODEL_NAME = "deepseek-chat"
 _SCRIPT_DIR = Path(__file__).resolve().parent
 INPUT_CSV = str(_SCRIPT_DIR / "test_cases.csv")
 OUTPUT_CSV = str(_SCRIPT_DIR / "full_results_output.csv")
-REVIEW_CSV = str(_SCRIPT_DIR / "human_review_needed.csv")  # 导出需人工复核的 case
+REVIEW_CSV = str(_SCRIPT_DIR / "human_review_needed.csv")
 
 REQUEST_TIMEOUT = 60
-MAX_WORKERS = 20
+MAX_WORKERS = 10  # 建议先调小一点进行测试
 
 # =========================
-# 🧠 Agent A: 原始 V6 法官 (The Judge)
+# 👨‍⚖️ Agent A: 独立法官 (The Judge)
 # =========================
 JUDGE_PROMPT_TEMPLATE = r"""
 # Role
@@ -107,245 +108,234 @@ JUDGE_PROMPT_TEMPLATE = r"""
 """.strip()
 
 # =========================
-# 🧠 Agent B: 审计专家 (The Auditor)
+# 🕵️‍♂️ Agent B: 独立对账员 (The Independent Auditor)
 # =========================
 AUDITOR_PROMPT_TEMPLATE = r"""
 # Role
-你是一个极度死板、铁面无私的质量合规质检机器。你不具备人类的同理心，你只执行僵化的关键字和规则匹配。绝对不要被法官长篇大论的“狡辩”洗脑！
+你是一个极度死板、专门负责“强行寻找联系”的对账员。你的任务不是追求判对，而是追求【拦截法官的滥杀】。
 
-# 输入信息
-[Query]: {query}
-[Result]: {result_title}
-[法官判定标签]: {judge_tag}
-[法官判定理由]: {judge_reason}
+# 核心判定红线（你必须执行最宽松的关联标准）
 
-# 僵化合规审查清单（严格按顺序触发，一旦命中立刻结束）
+【红线1：行业大类兜底（拦截 0 分的关键）】
+- 逻辑：只要 Q 和 R 属于同一个大行业，你【绝对不准】判定为“完全不相关”或“理解有误”。
+- 行业定义：
+  - 办公：Word, Excel, PPT, PDF, 钉钉等。
+  - 教育：英语, 数学, 考研, 公考等。
+  - ACG：海贼王, 死神, 火影, 咒术回战等。
+  - 运动：足球, 篮球, 健身, 减肥等。
+- 动作：只要属于上述大行业，哪怕主语换了（如：Excel变Word），你必须判定为【推荐同领域内容】。
 
-【红线1：跨界撒谎拦截（专治乱判0分）】
-- 检查动作：只要法官的标签是【完全不相关】或【query理解有误】，你必须像机器人一样检查以下两点：
-  1. 法官理由中是否出现了“同属”、“领域”、“大类”等字样（如：同属游戏、同属软件、同属考研、同属华为等）。
-  2. Query和Result是否确实同属于某个大行业（如都是游戏、都是软件、都是考研教育、都是数码家电）。
-- 触发条件：只要满足其一，不管法官后面怎么解释“毫无交集”、“完全不同”，它都在撒谎！
-- 判决：必须质疑 (Low)，理由写：“同属一个大行业，严禁判完全不相关”。
+【红线2：核心动作一致（拦截 0 分）】
+- 逻辑：剥离 Query 的动作（学、买、看、查、做、连）。
+- 动作：只要 Result 也是在做同样的动作，哪怕主语平替（如：A星变B星、A药变B药），你必须判定为【推荐同领域内容】。
 
-【红线2：虚假任务偏移拦截（专治丢词误判）】
-- 检查动作：如果法官标签是【推荐场景衍生内容】，检查法官是否把“丢词”狡辩成了“任务偏移”。
-- 触发条件：只有当 Query 中丢失的是【极小粒度的限制词】——例如【具体年份】（2024变2023）、【具体地理位置】（北京变其他）、【具体数字型号】（3060显卡、全国一卷），才触发此红线！
-- 豁免条件：如果是从“看电影”变成“看小品”，从“买真题”变成“报辅导班”，这是真正的诉求/形式偏移，【绝对不准】触发本红线！
-- 判决：必须质疑 (Medium)，理由写：“这是丢失了极小粒度的定语（年份/地区/型号），法官误判为任务偏移”。
+【红线3：核心主语保留（拦截 1 分偏移）】
+- 逻辑：只要 Result 标题里还保留着 Query 的核心主语（如：黑神话、iPhone）。
+- 动作：如果 Result 只是没包含具体年份、地点、价格，你必须判定为【丢词搜不准】。
 
-【红线3：标签字面冲突拦截】
-- 触发条件 A：理由写了“任务/诉求/动作发生偏移”，标签却是【同领域】。
-- 触发条件 B：理由写了“仅实体替换，任务没变”，标签却是【场景衍生】。
-- 判决：质疑 (Medium)，理由写：“理由与标签字面冲突”。
+# 归因标签（必须 5 选 1）
+- 完全不相关
+- 丢词搜不准
+- query理解有误
+- 推荐同领域内容
+- 推荐场景衍生内容
 
-【放行纪律】
-- 只要没有触发以上3条红线，哪怕你觉得法官是个白痴，你也【必须】无条件放行 (High，理由填无)！禁止自己加戏！
+# 执行指令
+法官喜欢判 0 分（不相关），你的天职是尝试寻找证据判 1 分（同领域/衍生/丢词）。只要你给了 1 分而法官给了 0 分，我们就成功拦截了一个潜在错误！
 
 # Output Format (严格JSON)
 {
-  "confidence_level": "High/Medium/Low",
-  "uncertainty_reason": "只填触发了哪条红线及简述 / 未触发红线填'无'",
-  "is_audit_agree": "true/false"
+  "bad_case_tag": "必须是5个标准标签之一",
+  "independent_reason": "简述你发现的行业或动作联系"
 }
+
+[Query]: {query}
+[Title]: {result_title}
+[Summary]: {result_summary}
 """
+
 # =========================
-# 辅助函数
+# 🛠️ 辅助工具函数
 # =========================
 def read_csv_with_fallback(path: str) -> pd.DataFrame:
-    # 依次尝试：带签名的UTF8 -> 中文GBK -> 标准UTF8 -> 扩展中文
     for enc in ["utf-8-sig", "gbk", "utf-8", "gb18030"]:
-        try:
-            return pd.read_csv(path, encoding=enc)
-        except UnicodeDecodeError:
-            continue
-    raise ValueError(f"无法读取文件 {path}，请确认文件格式是否正确。")
-
-
-def normalize_text(s: Any) -> str:
-    if s is None:
-        return ""
-    t = str(s).strip()
-    t = re.sub(r"\s+", "", t)
-    return t.lower()
-
-
-def is_tag_match(expected_tag: str, llm_tag: str) -> bool:
-    exp, pred = normalize_text(expected_tag), normalize_text(llm_tag)
-    if not exp or not pred:
-        return False
-    return exp == pred or exp in pred or pred in exp
-
-
-# =========================
-# ⚙️ 并发流水线逻辑
-# =========================
+        try: return pd.read_csv(path, encoding=enc)
+        except: continue
+    raise ValueError(f"无法读取文件 {path}")
 
 def safe_json_loads(text: str) -> Dict[str, Any]:
     text = (text or "").strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+    try: return json.loads(text)
+    except:
         match = re.search(r"\{.*\}", text, flags=re.DOTALL)
         if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
+            try: return json.loads(match.group(0))
+            except: pass
     return {}
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-def call_agents(client: OpenAI, query: str, title: str, summary: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    p1 = (
-        JUDGE_PROMPT_TEMPLATE.replace("{query}", query)
-        .replace("{result_title}", title)
-        .replace("{result_summary}", summary)
-    )
-    resp1 = client.chat.completions.create(
+def normalize_tag(tag: Any) -> str:
+    return re.sub(r"\s+", "", str(tag or "")).lower()
+
+# =========================
+# ⚙️ 双盲并联执行核心
+# =========================
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def single_agent_call(client, prompt):
+    resp = client.chat.completions.create(
         model=MODEL_NAME,
-        messages=[{"role": "user", "content": p1}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0,
         response_format={"type": "json_object"},
         timeout=REQUEST_TIMEOUT,
     )
-    raw1 = resp1.choices[0].message.content if resp1.choices else ""
-    judge_res = safe_json_loads(raw1)
+    return safe_json_loads(resp.choices[0].message.content if resp.choices else "")
 
-    p2 = (
-        AUDITOR_PROMPT_TEMPLATE.replace("{query}", query)
-        .replace("{result_title}", title)
-        .replace("{judge_tag}", str(judge_res.get("bad_case_tag", "")))
-        .replace("{judge_reason}", str(judge_res.get("final_reason", "")))
-    )
-    resp2 = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": p2}],
-        temperature=0,
-        response_format={"type": "json_object"},
-        timeout=REQUEST_TIMEOUT,
-    )
-    raw2 = resp2.choices[0].message.content if resp2.choices else ""
-    audit_res = safe_json_loads(raw2)
+def call_parallel_agents(client, query, title, summary):
+    # 使用 .replace 而不是 .format，防止 JSON 大括号导致的 KeyError
+    p1 = (JUDGE_PROMPT_TEMPLATE
+          .replace("{query}", query)
+          .replace("{result_title}", title)
+          .replace("{result_summary}", summary))
+    
+    p2 = (AUDITOR_PROMPT_TEMPLATE
+          .replace("{query}", query)
+          .replace("{result_title}", title)
+          .replace("{result_summary}", summary))
 
+    with ThreadPoolExecutor(max_workers=2) as inner_exec:
+        future_j = inner_exec.submit(single_agent_call, client, p1)
+        future_a = inner_exec.submit(single_agent_call, client, p2)
+        
+        judge_res = future_j.result()
+        audit_res = future_a.result()
+        
     return judge_res, audit_res
 
-def process_single_row(index, row, client):
+def process_row(index, row, client):
     q, t, s = str(row.get("query", "")), str(row.get("result_title", "")), str(row.get("result_summary", ""))
+    exp_tag = str(row.get("expected_tag", ""))
+    
     try:
-        judge, audit = call_agents(client, q, t, s)
-        pred_tag = str(judge.get("bad_case_tag", "")).strip()
-        exp_tag = str(row.get("expected_tag", ""))
+        # 【第一步：先执行并联请求】
+        judge, audit = call_parallel_agents(client, q, t, s)
+        
+        # 【第二步：提取 LLM 返回的标签内容】
+        j_tag_raw = judge.get("bad_case_tag", "Unknown")
+        a_tag_raw = audit.get("bad_case_tag", "Unknown")
+
+        # 【第三步：归一化处理】
+        judge_tag = normalize_tag(j_tag_raw)
+        auditor_tag = normalize_tag(a_tag_raw)
+
+        # 1. 标签映射表（解决“不相关”vs“完全不相关”的字面差异）
+        alias_map = {
+            "不相关": "完全不相关",
+            "理解有误": "query理解有误",
+            "平替": "推荐同领域内容",
+            "衍生": "推荐场景衍生内容"
+        }
+        j_final = alias_map.get(judge_tag, judge_tag)
+        a_final = alias_map.get(auditor_tag, auditor_tag)
+
+        # 2. 势能区划分（防止在“平替”和“衍生”之间过度报警）
+        zero_zone = ["完全不相关", "query理解有误"]
+        one_zone = ["丢词搜不准", "推荐同领域内容", "推荐场景衍生内容"]
+
+        # 3. 核心碰撞判定逻辑
+        if j_final == a_final:
+            is_collision = False
+        # 只有在“0分”和“1分”之间产生分歧，才触发报警（碰撞）
+        elif (j_final in zero_zone and a_final in one_zone) or (j_final in one_zone and a_final in zero_zone):
+            is_collision = True
+        else:
+            # 都在 1 分区（如同领域 vs 衍生），不报警，信任法官
+            is_collision = False
+        
         return {
             "index": index,
-            "llm_tag": pred_tag,
+            "llm_tag": j_tag_raw,
             "llm_reason": judge.get("final_reason", ""),
-            "confidence_level": str(audit.get("confidence_level", "High")),
-            "uncertainty_reason": str(audit.get("uncertainty_reason", "无")),
-            "is_audit_agree": str(audit.get("is_audit_agree", "true")),
-            "is_correct": is_tag_match(exp_tag, pred_tag),
+            "auditor_tag": a_tag_raw,
+            "auditor_reason": audit.get("independent_reason", ""),
+            "is_collision": is_collision,
+            "is_correct": normalize_tag(exp_tag) == normalize_tag(j_tag_raw)
         }
     except Exception as e:
-        # 修复了异常字典漏字段导致 Pandas KeyError 的 BUG
+        print(f"\n[Error at index {index}]: {traceback.format_exc()}")
         return {
-            "index": index, 
-            "llm_tag": "Error", 
-            "llm_reason": "程序执行异常",
-            "confidence_level": "Low", # 遇到错误强行标记为 Low 以便人工排查
-            "uncertainty_reason": f"代码报错: {str(e)}",
-            "is_audit_agree": "false",
-            "is_correct": False
+            "index": index, "llm_tag": "Error", "llm_reason": str(e),
+            "auditor_tag": "Error", "auditor_reason": "逻辑处理失败",
+            "is_collision": True, "is_correct": False
         }
 
 # =========================
 # 🏁 主程序
 # =========================
 def main():
-    if not API_KEY:
-        print("[错误] 请设置环境变量 DEEPSEEK_API_KEY 后重试。")
-        return
+    if not API_KEY: return print("[错误] 未设置 API KEY")
+    if not os.path.exists(INPUT_CSV): return print(f"[错误] 找不到输入文件: {INPUT_CSV}")
 
     df = read_csv_with_fallback(INPUT_CSV)
-    required = ["query", "result_title", "result_summary", "expected_tag"]
-    miss = [c for c in required if c not in df.columns]
-    if miss:
-        raise ValueError(f"输入 CSV 缺少列: {miss}")
-
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-    results: list = [None] * len(df)
+    results = [None] * len(df)
 
-    print("\n[开始] 双 Agent 串联评估 (V6 Judge + Auditor)...")
+    print(f"\n[开始] 双盲并联评估 (总数: {len(df)}, 并发: {MAX_WORKERS})...")
     start_time = time.time()
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        records = df.to_dict("records")
-        futures = {executor.submit(process_single_row, i, r, client) for i, r in enumerate(records)}
+        futures = {executor.submit(process_row, i, r, client): i for i, r in enumerate(df.to_dict("records"))}
         for future in tqdm(as_completed(futures), total=len(df), desc="进度"):
             res = future.result()
             results[res["index"]] = res
 
-    if any(r is None for r in results):
-        raise RuntimeError("部分行未返回结果，请检查并发与异常逻辑。")
-
-    res_df = df.copy().reset_index(drop=True)
-    for col in (
-        "llm_tag",
-        "llm_reason",
-        "confidence_level",
-        "uncertainty_reason",
-        "is_audit_agree",
-        "is_correct",
-    ):
+    # 结果整合
+    res_df = df.copy()
+    for col in ["llm_tag", "llm_reason", "auditor_tag", "auditor_reason", "is_collision", "is_correct"]:
         res_df[col] = [results[i][col] for i in range(len(df))]
 
     res_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    res_df[res_df["is_collision"] == True].to_csv(REVIEW_CSV, index=False, encoding="utf-8-sig")
 
-    conf_norm = res_df["confidence_level"].astype(str).str.strip().str.lower()
-    audit_disagree = res_df["is_audit_agree"].astype(str).str.lower() == "false"
-    review_needed = res_df[(conf_norm != "high") | audit_disagree]
-    review_needed.to_csv(REVIEW_CSV, index=False, encoding="utf-8-sig")
+    elapsed = time.time() - start_time
 
     # =========================
-    # 📈 新增：多维高阶评估指标
+    # 📈 高阶并联指标统计
     # =========================
     total_cases = len(res_df)
-    
-    # 1. 法官指标 (Judge Metrics)
-    judge_correct = res_df['is_correct'].sum()
-    judge_accuracy = judge_correct / total_cases if total_cases > 0 else 0
-    judge_wrong_total = total_cases - judge_correct
 
-    # 2. 审计员指标 (Auditor Metrics)
-    flagged_total = len(review_needed) # 审计员举手的总次数
-    
-    # 有效拦截：法官判错了，且审计员成功举手了 (True Positive)
-    true_interception = len(review_needed[review_needed['is_correct'] == False])
-    
-    # 误伤：法官其实判对了，但审计员觉得有问题 (False Positive)
-    false_interception = len(review_needed[review_needed['is_correct'] == True])
-    
-    # 漏网之鱼：法官判错了，但审计员没发现 (False Negative)
-    missed_errors = judge_wrong_total - true_interception
+    # 1. 法官独立表现
+    judge_correct_count = res_df['is_correct'].sum()
+    judge_accuracy = judge_correct_count / total_cases
+    judge_wrong_df = res_df[res_df['is_correct'] == False]
+    total_judge_errors = len(judge_wrong_df)
 
-    sep = "=" * 40
-    elapsed = time.time() - start_time
-    print(f"\n[完成] 耗时: {elapsed:.2f} 秒")
-    print(sep)
-    print(" [Agent A 法官]")
-    print(f"    - 法官对齐率: {judge_accuracy:.2%} ({judge_correct}/{total_cases})")
-    print(f"    - 法官判错数: {judge_wrong_total}")
-    print(sep)
-    print(" [Agent B 审计]")
-    print(f"    - 质疑条数: {flagged_total}")
-    tp_rate = (true_interception / judge_wrong_total) if judge_wrong_total else 0.0
-    fp_rate = (false_interception / judge_correct) if judge_correct else 0.0
-    print(f"    - 错案中被标记: {tp_rate:.2%} ({true_interception}/{judge_wrong_total})")
-    print(f"    - 对案中被误标: {fp_rate:.2%} ({false_interception}/{judge_correct})")
-    print(f"    - 错案未标记数: {missed_errors}")
-    print(sep)
-    print(f" 待复核列表: {REVIEW_CSV} (共 {flagged_total} 条)")
+    # 2. 盲审碰撞效能
+    # 成功召回：法官错了，且两人标签不同（碰撞成功）
+    successfully_caught = judge_wrong_df['is_collision'].sum()
+    collision_recall = successfully_caught / total_judge_errors if total_judge_errors > 0 else 0
+    
+    # 3. 剩余风险 (静默错误)
+    # 漏网之鱼：法官错了，但两人标签一样（碰撞失败）
+    silent_errors_count = total_judge_errors - successfully_caught
+    residual_error_rate = silent_errors_count / total_cases
 
-    accuracy = float(res_df["is_correct"].mean())
-    print(f"\n全量对齐率: {accuracy:.2%}")
-    print(f"待复核导出: {REVIEW_CSV} (共 {len(review_needed)} 条)")
+    print(f"\n{'='*50}")
+    print(f"📊 并联对账系统效能报告")
+    print(f"{'='*50}")
+    print(f"完成！耗时: {elapsed:.2f}s")
+    print(f"1. [基准] 法官独立准确率: {judge_accuracy:.2%}")
+    print(f"   - 在 {total_cases} 条数据中，法官判对了 {judge_correct_count} 条")
+    print(f"   - 原始错误存量: {total_judge_errors} 条")
+    print(f"-"*50)
+    print(f"2. [核心] 盲审召回率 (Recall): {collision_recall:.2%}")
+    print(f"   - 成功通过“标签分歧”拦截了 {successfully_caught} 个法官错误")
+    print(f"   - 拦截后的人工复核池大小: {res_df['is_collision'].sum()} 条")
+    print(f"-"*50)
+    print(f"3. [风险] 剩余漏网率 (Residual Error): {residual_error_rate:.2%}")
+    print(f"   - 共有 {silent_errors_count} 条错误因两人“错得一致”而逃逸")
+    print(f"   - 最终入库数据的潜在纯度约为: {1 - residual_error_rate:.2%}")
+    print(f"{'='*50}")
 
 if __name__ == "__main__":
     main()
