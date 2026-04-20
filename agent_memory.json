@@ -1,0 +1,57 @@
+[
+  {
+    "example_query": "跑步机 品牌 推荐",
+    "correct_tag": "同领域场景",
+    "human_rule": "品牌推荐与选购指南是一个需求诉求"
+  },
+  {
+    "example_query": "股票 开户 流程",
+    "correct_tag": "推荐场景衍生内容",
+    "human_rule": "宏观领域一致，需求诉求改变"
+  },
+  {
+    "example_query": "玫瑰花 种植 技术",
+    "correct_tag": "推荐同领域内容",
+    "human_rule": "种植与养护本质上诉求差不多"
+  },
+  {
+    "example_query": "重庆 老 火锅",
+    "correct_tag": "推荐衍生场景内容",
+    "human_rule": "存在一定关联性"
+  },
+  {
+    "example_query": "附近 健身房 办卡",
+    "correct_tag": "推荐衍生场景内容",
+    "human_rule": "具有一定关联"
+  },
+  {
+    "example_query": "零基础 英语 口语",
+    "correct_tag": "推荐场景衍生内容",
+    "human_rule": "宏观领域相同"
+  },
+  {
+    "example_query": "显卡 跑分 软件",
+    "correct_tag": "丢词搜不准",
+    "human_rule": "结果中跑分和软件没识别出来"
+  },
+  {
+    "example_query": "水彩画 风景 教程",
+    "correct_tag": "推荐场景衍生内容",
+    "human_rule": ""
+  },
+  {
+    "example_query": "华为 Mate 60 RS",
+    "correct_tag": "丢词搜不准",
+    "human_rule": "搜的是具体型号，但是返回的是另一个型号，丢失了RS这个限定条件"
+  },
+  {
+    "example_query": "微信 聊天 记录 恢复",
+    "correct_tag": "丢词搜不准，有明确需求为微信，但推的是QQ",
+    "human_rule": "有明确需求为微信，但推的是QQ"
+  },
+  {
+    "example_query": "巴黎 旅游 攻略",
+    "correct_tag": "推荐场景衍生内容",
+    "human_rule": "圣母院属于旅游景点，而且历史纪录片也能帮助游客在旅游时更身临其境，符合部分游客的攻略需求"
+  }
+]
