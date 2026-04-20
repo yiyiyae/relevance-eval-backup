@@ -27,7 +27,7 @@ MODEL_NAME = "deepseek-chat"
 MAX_WORKERS = 10 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-INPUT_CSV = str(_SCRIPT_DIR / "test_cases.csv")
+INPUT_CSV = str(_SCRIPT_DIR / "test_cases_new.csv")
 OUTPUT_CSV = str(_SCRIPT_DIR / "new_full_results_output.csv")
 
 # 【RAG 升级】从单一的 json 文件变成本地向量数据库文件夹
@@ -81,20 +81,58 @@ class RagSearchEvalAgent:
         self.collection = self.chroma_client.get_or_create_collection(name="eval_rules")
         print(f"📦 [向量库就绪] 当前知识库已包含 {self.collection.count()} 条人类规则。")
 
-    def learn(self, query: str, correct_tag: str, human_rule: str):
-        """将人类的规则转化为向量，并永久保存"""
-        # 生成唯一 ID
+    # search_rel_eval.py 中的 learn 函数修改
+    def learn(self, query: str, correct_tag: str, human_rule: str, source: str = "Human"):
+        """将规则存入向量库，增加 source 标记 (已确认缩进)"""
         doc_id = f"rule_{int(time.time() * 1000)}"
         
-        # 将用户的 Query 和 Rule 组合作为被向量化的文本（方便后续根据语义相似度检索）
-        embedding_text = f"搜索词：{query}。判定规则：{human_rule}"
-        
+        # 将元数据存入，包含规则来源
         self.collection.add(
-            documents=[embedding_text],
-            metadatas=[{"query": query, "correct_tag": correct_tag, "human_rule": human_rule}],
+            documents=[query],
+            metadatas=[{
+                "query": query, 
+                "correct_tag": correct_tag, 
+                "human_rule": human_rule,
+                "source": source  # 🤖 AI 或 👤 Human
+            }],
             ids=[doc_id]
         )
-        print(f"✨ [Agent 顿悟] 规则已进行高维向量化并写入记忆库！")
+        print(f"✨ [Agent 顿悟] 规则 ({source}) 已写入记忆库！")
+
+    def auto_extract_rule(self, query: str, title: str, summary: str, correct_tag: str, wrong_tag: str) -> str:
+        """AI 自动从人类的纠偏动作中提炼抽象规则"""
+        
+        prompt = f"""
+你是一个搜索质量专家。系统最近将一个 Case 判定错了，请根据人类的修正，总结出一条【高度抽象、可迁移】的判定规则。
+
+[案例信息]
+Query: {query}
+标题: {title}
+摘要: {summary}
+
+[纠偏记录]
+机器原判: {wrong_tag}
+人类修正为: {correct_tag}
+
+# 任务要求：
+1. 解释为什么该 Case 属于 {correct_tag} 而非 {wrong_tag}。
+2. ⚠️ 严禁提及具体的词汇（如“苹果”、“iPhone”）。
+3. 必须使用抽象描述（如“主语品牌平替”、“核心意图偏移”、“修饰词丢失”）。
+4. 长度控制在 30 字以内。
+
+# 输出格式 (JSON)
+{{
+  "abstract_rule": "总结的抽象准则"
+}}
+"""
+        try:
+            # 适当调高温度，增加归纳能力
+            res = self._call_llm_with_retry(prompt, temperature=0.5)
+            return res.get("abstract_rule", f"识别到{correct_tag}特征，修正原判{wrong_tag}")
+        except:
+            return f"人类专家强制判定为{correct_tag}"
+
+
 
     def _retrieve_relevant_rules(self, query: str, top_k: int = 3) -> List[dict]:
         """RAG 核心：根据当前的 Query，检索最相似的历史规则"""
@@ -117,10 +155,13 @@ class RagSearchEvalAgent:
         except: return {}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _call_llm_with_retry(self, prompt: str) -> dict:
+    def _call_llm_with_retry(self, prompt: str, temperature: float = 0.0) -> dict:
+        # ⚠️ 注意这里新增了 temperature 参数
         resp = self.client.chat.completions.create(
-            model=MODEL_NAME, messages=[{"role": "user", "content": prompt}],
-            temperature=0, response_format={"type": "json_object"}
+            model=MODEL_NAME, 
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature, # 使用传入的温度
+            response_format={"type": "json_object"}
         )
         return self._safe_json_loads(resp.choices[0].message.content)
 
@@ -183,11 +224,10 @@ class RagSearchEvalAgent:
 - 推荐同领域内容
 - 推荐场景衍生内容
 
-# Output Format (严格JSON)
+# Output Format (严格JSON，请勿输出额外字段)
 {{
   "thought_process": "你的思考步骤",
-  "bad_case_tag": "必须是5个标准标签之一",
-  "confidence_score": 95
+  "bad_case_tag": "必须是5个标准标签之一"
 }}
 [当前任务]
 [Query]: {query}
@@ -195,10 +235,58 @@ class RagSearchEvalAgent:
 [Summary]: {summary}
 """
         try:
-            return self._call_llm_with_retry(base_prompt + memory_section + tail_prompt)
+            import concurrent.futures
+            from collections import Counter
+            
+            final_prompt = base_prompt + memory_section + tail_prompt
+            results = []
+            
+            # 开启 3 个线程，对同一个 Case 采样 3 次，温度设为 0.6 增加多样性
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(self._call_llm_with_retry, final_prompt, 0.6) for _ in range(3)]
+                for future in concurrent.futures.as_completed(futures):
+                    res = future.result()
+                    if "bad_case_tag" in res:
+                        results.append(res)
+            
+            if not results:
+                return {"bad_case_tag": "Error", "confidence_score": 0, "thought_process": "API全量失败"}
+
+            # --- 统计学一致性投票 ---
+            tags = [r.get("bad_case_tag", "Unknown") for r in results]
+            tag_counts = Counter(tags)
+            
+            # 找出得票数最多的标签
+            most_common_tag, count = tag_counts.most_common(1)[0]
+            
+            # 制定客观置信度
+            if count == 3:
+                confidence = 100  # 3次全一致，极度确信
+            elif count == 2:
+                confidence = 66   # 2:1 分歧，模糊边界
+            else:
+                confidence = 33   # 1:1:1 彻底混乱
+
+            # 提取获胜标签的任意一个思维链
+            final_reason = ""
+            for r in results:
+                if r.get("bad_case_tag") == most_common_tag:
+                    final_reason = r.get("thought_process", "")
+                    break
+                    
+            # 💡 神来之笔：如果出现分歧，把分歧记录追加到理由里给前端看
+            if count < 3:
+                final_reason += f"\n\n🚨 [系统提示]：AI 内部产生分歧，投票分布为 {dict(tag_counts)}"
+
+            return {
+                "thought_process": final_reason,
+                "bad_case_tag": most_common_tag,
+                "confidence_score": confidence
+            }
+            
         except Exception as e:
             return {"bad_case_tag": "Error", "confidence_score": 0, "thought_process": str(e)}
-
+            
 # =========================
 # ⚙️ 并发 Worker 函数
 # =========================
