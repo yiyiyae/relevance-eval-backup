@@ -7,13 +7,16 @@ import re
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from openai import OpenAI
 from tqdm import tqdm
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+# 引入 RAG 核心组件
+import chromadb
 
 # =========================
 # ⚙️ 核心配置区
@@ -24,21 +27,19 @@ MODEL_NAME = "deepseek-chat"
 MAX_WORKERS = 10 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-INPUT_CSV = str(_SCRIPT_DIR / "test_cases_new.csv")
+INPUT_CSV = str(_SCRIPT_DIR / "test_cases.csv")
 OUTPUT_CSV = str(_SCRIPT_DIR / "new_full_results_output.csv")
-MEMORY_FILE = str(_SCRIPT_DIR / "agent_memory.json")
 
-# 标准标签库（用于快捷键映射）
+# 【RAG 升级】从单一的 json 文件变成本地向量数据库文件夹
+CHROMA_DB_PATH = str(_SCRIPT_DIR / "agent_vector_db") 
+
 TAG_DICT = {
-    "1": "完全不相关",
-    "2": "丢词搜不准",
-    "3": "query理解有误",
-    "4": "推荐同领域内容",
-    "5": "推荐场景衍生内容"
+    "1": "完全不相关", "2": "丢词搜不准", "3": "query理解有误", 
+    "4": "推荐同领域内容", "5": "推荐场景衍生内容"
 }
 
 # =========================
-# 🛠️ 断点续传与文件辅助
+# 🛠️ 断点续传辅助
 # =========================
 def read_csv_with_fallback(path: str) -> pd.DataFrame:
     for enc in ["utf-8-sig", "gbk", "utf-8", "gb18030"]:
@@ -47,24 +48,19 @@ def read_csv_with_fallback(path: str) -> pd.DataFrame:
     raise ValueError(f"无法读取文件 {path}")
 
 def get_processed_queries() -> set:
-    """读取已完成的进度，实现断点续传"""
     if os.path.exists(OUTPUT_CSV):
         try:
             df = read_csv_with_fallback(OUTPUT_CSV)
             if "query" in df.columns:
                 return set(df["query"].astype(str).tolist())
-        except:
-            pass
+        except: pass
     return set()
 
 def append_to_output(results_list: list):
-    """增量保存，防止中途退出丢失数据"""
     if not results_list: return
     df_new = pd.DataFrame(results_list)
-    # 清理中间状态字段
     if "needs_intervention" in df_new.columns:
         df_new.drop(columns=["needs_intervention"], inplace=True)
-        
     if os.path.exists(OUTPUT_CSV):
         df_old = read_csv_with_fallback(OUTPUT_CSV)
         df_combined = pd.concat([df_old, df_new], ignore_index=True)
@@ -73,28 +69,47 @@ def append_to_output(results_list: list):
         df_new.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
 # =========================
-# 🧠 Agent 核心类
+# 🧠 具备 RAG 长期记忆的 Agent 核心类
 # =========================
-class SearchEvalAgent:
-    def __init__(self, memory_file: str):
-        self.memory_file = memory_file
+class RagSearchEvalAgent:
+    def __init__(self, db_path: str):
         self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-        self.memory = self._load_memory()
-
-    def _load_memory(self) -> list:
-        if os.path.exists(self.memory_file):
-            try:
-                with open(self.memory_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except: pass
-        return []
+        
+        # 1. 初始化本地向量数据库
+        self.chroma_client = chromadb.PersistentClient(path=db_path)
+        # 2. 获取或创建名为 "eval_rules" 的集合（类似于数据库的表）
+        self.collection = self.chroma_client.get_or_create_collection(name="eval_rules")
+        print(f"📦 [向量库就绪] 当前知识库已包含 {self.collection.count()} 条人类规则。")
 
     def learn(self, query: str, correct_tag: str, human_rule: str):
-        new_knowledge = {"example_query": query, "correct_tag": correct_tag, "human_rule": human_rule}
-        self.memory.append(new_knowledge)
-        with open(self.memory_file, 'w', encoding='utf-8') as f:
-            json.dump(self.memory, f, ensure_ascii=False, indent=2)
-        print(f"✨ [Agent 顿悟] 已将规则写入记忆库：{human_rule}")
+        """将人类的规则转化为向量，并永久保存"""
+        # 生成唯一 ID
+        doc_id = f"rule_{int(time.time() * 1000)}"
+        
+        # 将用户的 Query 和 Rule 组合作为被向量化的文本（方便后续根据语义相似度检索）
+        embedding_text = f"搜索词：{query}。判定规则：{human_rule}"
+        
+        self.collection.add(
+            documents=[embedding_text],
+            metadatas=[{"query": query, "correct_tag": correct_tag, "human_rule": human_rule}],
+            ids=[doc_id]
+        )
+        print(f"✨ [Agent 顿悟] 规则已进行高维向量化并写入记忆库！")
+
+    def _retrieve_relevant_rules(self, query: str, top_k: int = 3) -> List[dict]:
+        """RAG 核心：根据当前的 Query，检索最相似的历史规则"""
+        if self.collection.count() == 0:
+            return []
+            
+        # 限制 k 值不能超过数据库里的实际总量
+        k = min(top_k, self.collection.count())
+        
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=k
+        )
+        # 返回检索到的元数据列表
+        return results['metadatas'][0] if results['metadatas'] else []
 
     @staticmethod
     def _safe_json_loads(text: str) -> Dict[str, Any]:
@@ -112,7 +127,7 @@ class SearchEvalAgent:
     def evaluate(self, query: str, title: str, summary: str) -> dict:
         base_prompt = r"""
 # Role
-你是一个极其严谨的搜索质量策略专家兼风控排雷大师。你的任务是诊断搜索 Bad Case 的缺陷类型，并在遇到模糊边界时主动标记需要人工复核。
+你是一个极其严谨的搜索质量策略专家兼风控排雷大师。你的任务是诊断搜索 Bad Case 的缺陷类型，并在遇到模糊边界时主动标记低置信度。
 
 # 核心原则
 【严格区分"同领域"与"场景衍生"】
@@ -120,7 +135,6 @@ class SearchEvalAgent:
 - "场景衍生"是：宏观领域一致，但用户要解决的问题（任务/动作）发生了偏移。
 
 # 判定大纲与经典判例（请严格作为你的分类标尺！）
-
 【第一步：宏观领域跨界与多义词排雷】
 1. 判断双方是否属于同一个【超大行业/超大类目】。
 2. 若完全跨界（毫无交集），必须严格区分以下两种情况：
@@ -129,7 +143,6 @@ class SearchEvalAgent:
 
 【第二步：核心诉求与实体的二维判断】
 若宏观领域一致，请按以下标准区分两种 1 分泛化：
-
 - 类别A【推荐同领域内容（平行实体替换）】：
   定义：用户的【核心动作/诉求】没变，仅仅是【核心实体】被替换成了同分类下的其他兄弟实体（换人、换物、换剧、换竞品）。
   - 判例1：搜“猫咪吐毛球” → 给“狗狗护理”。（实体：猫变狗。判定：同领域）
@@ -149,11 +162,17 @@ class SearchEvalAgent:
   - 判例8：婴儿浴巾 变 家用成人浴巾。（丢了“婴儿”限制词。判定：丢词搜不准）
   🚨 丢词防坑红线：绝对不要把主语（如：Python、护照、电影、主题曲）当成限制词/定语！丢了主语算场景衍生或不相关，绝对不算丢词搜不准。
 """
+        
+        # ==================================================
+        # 🌟 动态 RAG 注入区：只加载最相关的 Top 3 记忆
+        # ==================================================
+        relevant_memory = self._retrieve_relevant_rules(query, top_k=3)
         memory_section = ""
-        if self.memory:
-            memory_section = "\n=========================================\n# 💡 你的绝对行动纲领（前人总结的经验，优先级最高）\n请优先参考以下真实业务的纠偏记录，如果当前的 Query 与其中情况类似，直接套用人类指定的规则和标签：\n"
-            for i, mem in enumerate(self.memory):
-                memory_section += f"- 案例{i+1}: 搜【{mem['example_query']}】时，人类判定的规则是：{mem['human_rule']} -> 必须判为【{mem['correct_tag']}】\n"
+        
+        if relevant_memory:
+            memory_section = "\n=========================================\n# 💡 高优先级相关经验（由外部向量库召回）\n请高度重视以下人类历史上针对类似 Query 的判定规则：\n"
+            for i, mem in enumerate(relevant_memory):
+                memory_section += f"- 相似历史案例{i+1}: 搜【{mem['query']}】时，适用规则【{mem['human_rule']}】 -> 结论是【{mem['correct_tag']}】\n"
 
         tail_prompt = f"""
 =========================================
@@ -168,8 +187,9 @@ class SearchEvalAgent:
 {{
   "thought_process": "你的思考步骤",
   "bad_case_tag": "必须是5个标准标签之一",
-  "confidence_score": 85
+  "confidence_score": 95
 }}
+[当前任务]
 [Query]: {query}
 [Title]: {title}
 [Summary]: {summary}
@@ -196,17 +216,16 @@ def process_row(index, row, agent):
         "index": index, "query": q, "result_title": t, "result_summary": s, "expected_tag": exp_tag,
         "llm_tag": pred_tag, "llm_reason": res.get("thought_process", ""), "confidence": confidence,
         "is_correct": re.sub(r"\s+", "", pred_tag).lower() == re.sub(r"\s+", "", exp_tag),
-        "needs_intervention": confidence < 85
+        "needs_intervention": confidence < 95
     }
 
 # =========================
-# 🏁 主程序 (断点续传 + 快捷键交互)
+# 🏁 主程序
 # =========================
 def main():
     if not API_KEY: return print("[错误] 未设置 API KEY")
     df_all = read_csv_with_fallback(INPUT_CSV)
     
-    # 🌟 断点续传逻辑：过滤掉已经处理过的数据
     processed_queries = get_processed_queries()
     df_todo = df_all[~df_all['query'].astype(str).isin(processed_queries)].copy()
     
@@ -214,13 +233,12 @@ def main():
         return print(f"\n🎉 恭喜！{INPUT_CSV} 中的所有数据都已处理完毕。结果在 {OUTPUT_CSV}")
         
     print(f"\n{'='*50}")
-    print(f"🚀 V40.2 启动 (已跳过 {len(processed_queries)} 条历史进度，剩余 {len(df_todo)} 条待处理)")
+    print(f"🚀 V50.0 RAG 架构启动 (剩余 {len(df_todo)} 条待处理)")
     print(f"{'='*50}")
 
-    agent = SearchEvalAgent(MEMORY_FILE)
-    results_auto = [] # 存放高置信度结果
+    agent = RagSearchEvalAgent(CHROMA_DB_PATH)
+    results_auto = []
 
-    # 第一阶段：极速并发机审
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_row, i, r, agent): i for i, r in enumerate(df_todo.to_dict("records"))}
@@ -228,61 +246,45 @@ def main():
             res = future.result()
             results_auto.append(res)
 
-    # 分离出高低置信度
     high_conf_results = [r for r in results_auto if not r["needs_intervention"]]
     intervention_queue = [r for r in results_auto if r["needs_intervention"]]
     
-    # 将不需要干预的数据立刻落盘，保障进度！
     if high_conf_results:
         append_to_output(high_conf_results)
 
-    print(f"\n✅ 机审阶段完成！耗时: {time.time() - start_time:.2f}s")
-    print(f"💾 高置信度数据已保存入库。")
-    print(f"⚠️ 发现 {len(intervention_queue)} 条低置信度数据，即将进入集中教学模式...")
+    print(f"\n✅ RAG 机审阶段完成！耗时: {time.time() - start_time:.2f}s")
+    print(f"⚠️ 发现 {len(intervention_queue)} 条低置信度数据，即将进入人工教学...")
     time.sleep(1)
     
-    # 第二阶段：集中人工教学（支持快捷键与随时退出）
     if intervention_queue:
         print(f"\n{'='*50}\n👨‍🏫 阶段二：集中人工教学 (按 0 随时保存退出)\n{'='*50}")
-        
         for item in intervention_queue:
             print(f"\n🔍 Query: 【{item['query']}】")
             print(f"   [Title]: {item['result_title']}")
             print(f"   [Summary]: {item['result_summary']}")
             print(f"   [机器判定]: {item['llm_tag']} (思路: {item['llm_reason']})")
             
-            # 🌟 多选交互界面
-            print("\n   🎯 请选择正确标签 (输入数字):")
-            print("   [1] 完全不相关     [2] 丢词搜不准      [3] query理解有误")
-            print("   [4] 推荐同领域内容 [5] 推荐场景衍生内容")
-            print("   [回车] 保持机器原判  [0] 💾 保存进度并下班！")
-            
-            choice = input(">> 你的选择: ").strip()
+            print("\n   🎯 [1]完全不相关 [2]丢词搜不准 [3]query理解有误 [4]同领域 [5]衍生 [回车]原判 [0]退出")
+            choice = input(">> 选择: ").strip()
             
             if choice == "0":
-                print("\n👋 收到！正在保存当前进度，明天见！")
-                break # 跳出循环，结束程序
+                print("\n👋 保存进度，安全退出！")
+                break
                 
             elif choice in TAG_DICT:
                 human_tag = TAG_DICT[choice]
-                human_rule = input(f">> 已选【{human_tag}】，请输入一条判别规则教给它 (例: '找正片变成看花絮判衍生'): ").strip()
+                human_rule = input(f">> 已选【{human_tag}】，请输入判别规则: ").strip()
                 if human_rule:
                     agent.learn(item['query'], human_tag, human_rule)
                 
-                # 覆写结果
                 item['llm_tag'] = human_tag
                 item['is_correct'] = re.sub(r"\s+", "", human_tag).lower() == re.sub(r"\s+", "", item['expected_tag']).lower()
-            elif choice != "":
-                print("[警告] 输入无效，默认保持机器原判。")
 
-            # 用户每处理完一条，立刻将这一条落盘保存！
             append_to_output([item])
             print("-" * 40)
 
     print(f"\n{'='*50}")
-    print(f"✅ 本次任务执行完毕！")
-    print(f"🧠 Agent 最新记忆容量: {len(agent.memory)} 条经验")
-    print(f"📁 累计所有结果已安全保存在: {OUTPUT_CSV}")
+    print(f"✅ 任务完毕！当前向量库容量: {agent.collection.count()} 条经验")
     print(f"{'='*50}")
 
 if __name__ == "__main__":
