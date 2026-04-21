@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import html
 import json
 import os
 import re
 import time
-import traceback
-from pathlib import Path
-from typing import Dict, Any, List
+import unicodedata
+import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlencode
 
-import pandas as pd
-from openai import OpenAI
-from tqdm import tqdm
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-# 引入 RAG 核心组件
 import chromadb
+import pandas as pd
+import requests
+from openai import OpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential
+from tqdm import tqdm
 
 # =========================
 # ⚙️ 核心配置区
@@ -24,49 +27,492 @@ import chromadb
 API_KEY = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
 BASE_URL = "https://api.deepseek.com"
 MODEL_NAME = "deepseek-chat"
-MAX_WORKERS = 10 
+MAX_WORKERS = 4
+VOTE_SAMPLES = 3
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 INPUT_CSV = str(_SCRIPT_DIR / "test_cases_new.csv")
 OUTPUT_CSV = str(_SCRIPT_DIR / "new_full_results_output.csv")
-
-# 【RAG 升级】从单一的 json 文件变成本地向量数据库文件夹
-CHROMA_DB_PATH = str(_SCRIPT_DIR / "agent_vector_db") 
+CHROMA_DB_PATH = str(_SCRIPT_DIR / "agent_vector_db")
 
 TAG_DICT = {
-    "1": "完全不相关", "2": "丢词搜不准", "3": "query理解有误", 
-    "4": "推荐同领域内容", "5": "推荐场景衍生内容"
+    "1": "完全不相关",
+    "2": "丢词搜不准",
+    "3": "query理解有误",
+    "4": "推荐同领域内容",
+    "5": "推荐场景衍生内容",
 }
 
-# =========================
-# 🛠️ 断点续传辅助
-# =========================
-def read_csv_with_fallback(path: str) -> pd.DataFrame:
-    for enc in ["utf-8-sig", "gbk", "utf-8", "gb18030"]:
-        try: return pd.read_csv(path, encoding=enc)
-        except: continue
-    raise ValueError(f"无法读取文件 {path}")
+SOURCE_AI = "AI"
+SOURCE_HUMAN = "Human"
 
-def get_processed_queries() -> set:
-    if os.path.exists(OUTPUT_CSV):
+BILI_SEARCH_API = "https://api.bilibili.com/x/web-interface/search/type"
+BILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"
+BILI_TAG_API = "https://api.bilibili.com/x/tag/archive/tags"
+BILI_SEARCH_URL_TEMPLATE = "https://search.bilibili.com/video?keyword={keyword}"
+BILI_CANDIDATE_SCAN_LIMIT = 30
+BILI_PREFETCH_META_LIMIT = 20
+GENERIC_BILI_TAGS = {
+    "哔哩哔哩", "bilibili", "b站", "高清视频", "在线观看", "弹幕", "视频", "原创",
+}
+
+
+# =========================
+# 🛠️ 通用辅助
+# =========================
+def normalize_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def clean_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("\xa0", " ").replace("\u200b", "")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_title_for_match(value: Any) -> str:
+    text = clean_text(value)
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"_哔哩哔哩_bilibili$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[-_\s]*哔哩哔哩(?:_bilibili)?$", "", text, flags=re.IGNORECASE)
+    chars: List[str] = []
+    for ch in text.lower():
+        cat = unicodedata.category(ch)
+        if ch.isspace():
+            continue
+        if cat.startswith("P") or cat.startswith("S"):
+            continue
+        chars.append(ch)
+    return "".join(chars).strip()
+
+
+def build_case_key(query: Any, title: Any, summary: Any) -> str:
+    return " || ".join([
+        normalize_text(query),
+        normalize_text(title),
+        normalize_text(summary),
+    ])
+
+
+def read_csv_with_fallback(path_or_buffer) -> pd.DataFrame:
+    last_error = None
+    for enc in ["utf-8-sig", "utf-8", "gb18030", "gbk"]:
         try:
-            df = read_csv_with_fallback(OUTPUT_CSV)
-            if "query" in df.columns:
-                return set(df["query"].astype(str).tolist())
-        except: pass
+            if hasattr(path_or_buffer, "seek"):
+                path_or_buffer.seek(0)
+            return pd.read_csv(path_or_buffer, encoding=enc)
+        except Exception as exc:
+            last_error = exc
+    raise ValueError(f"无法读取 CSV: {last_error}")
+
+
+def ensure_case_key(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "case_key" not in df.columns:
+        required = {"query", "result_title", "result_summary"}
+        if required.issubset(df.columns):
+            df["case_key"] = df.apply(
+                lambda r: build_case_key(r["query"], r["result_title"], r["result_summary"]), axis=1
+            )
+    return df
+
+
+def load_output_df() -> pd.DataFrame:
+    if not os.path.exists(OUTPUT_CSV):
+        return pd.DataFrame()
+    try:
+        return ensure_case_key(read_csv_with_fallback(OUTPUT_CSV))
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_processed_case_keys() -> set:
+    df = load_output_df()
+    if df.empty:
+        return set()
+    if "case_key" in df.columns:
+        return set(df["case_key"].astype(str).tolist())
+    if "query" in df.columns:
+        return set(df["query"].astype(str).tolist())
     return set()
 
+
 def append_to_output(results_list: list):
-    if not results_list: return
+    if not results_list:
+        return
+
     df_new = pd.DataFrame(results_list)
     if "needs_intervention" in df_new.columns:
-        df_new.drop(columns=["needs_intervention"], inplace=True)
-    if os.path.exists(OUTPUT_CSV):
-        df_old = read_csv_with_fallback(OUTPUT_CSV)
-        df_combined = pd.concat([df_old, df_new], ignore_index=True)
-        df_combined.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+        df_new = df_new.drop(columns=["needs_intervention"])
+    if "reviewed" not in df_new.columns:
+        df_new["reviewed"] = False
+    df_new = ensure_case_key(df_new)
+
+    df_old = load_output_df()
+    if df_old.empty:
+        df_combined = df_new
     else:
-        df_new.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+        df_combined = pd.concat([df_old, df_new], ignore_index=True)
+
+    if "case_key" in df_combined.columns:
+        df_combined = df_combined.drop_duplicates(subset=["case_key"], keep="last")
+
+    df_combined.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+
+
+# =========================
+# 🎬 B 站标题回查 + 摘要助手
+# =========================
+class BilibiliVideoSummaryHelper:
+    def __init__(self, client: OpenAI, model_name: str = MODEL_NAME, timeout: int = 10):
+        self.client = client
+        self.model_name = model_name
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.bilibili.com/",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._primed = False
+
+    def _prime_session(self):
+        if self._primed:
+            return
+        try:
+            self.session.get("https://www.bilibili.com/", timeout=self.timeout)
+        except Exception:
+            pass
+        self._primed = True
+
+    @staticmethod
+    def _safe_json_loads(text: str) -> Dict[str, Any]:
+        try:
+            return json.loads(re.search(r"\{.*\}", text or "", flags=re.DOTALL).group(0))
+        except Exception:
+            return {}
+
+    def _keyword_variants(self, title: str) -> List[str]:
+        raw = clean_text(title)
+        variants: List[str] = []
+        candidates = [
+            raw,
+            raw.strip("《》〈〉【】[]()（）"),
+            raw.replace("《", "").replace("》", ""),
+            re.sub(r"\s+", " ", raw),
+            re.sub(r"[《》〈〉【】\[\]()（）]", " ", raw),
+            re.sub(r"[!！?？:：·•,，.。/\\\-—_~`'\"“”‘’]", " ", raw),
+        ]
+        for item in candidates:
+            item = clean_text(item)
+            if item and item not in variants:
+                variants.append(item)
+        return variants[:5]
+
+    def _http_get_json(self, url: str, params: Optional[dict] = None) -> dict:
+        self._prime_session()
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _http_get_text(self, url: str, params: Optional[dict] = None) -> str:
+        self._prime_session()
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        if not resp.encoding:
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        return resp.text
+
+    def _search_videos_via_api(self, keyword: str) -> List[dict]:
+        params = {
+            "search_type": "video",
+            "keyword": keyword,
+            "page": 1,
+            "order": "totalrank",
+        }
+        payload = self._http_get_json(BILI_SEARCH_API, params=params)
+        result_list = (((payload or {}).get("data") or {}).get("result") or [])
+        rows: List[dict] = []
+        for item in result_list:
+            title = clean_text(item.get("title", ""))
+            arcurl = clean_text(item.get("arcurl", ""))
+            bvid = clean_text(item.get("bvid", ""))
+            if not bvid and arcurl:
+                m = re.search(r"/video/(BV[0-9A-Za-z]+)", arcurl)
+                if m:
+                    bvid = m.group(1)
+            rows.append({
+                "video_title": title,
+                "video_url": arcurl,
+                "bvid": bvid,
+                "desc": clean_text(item.get("description", "")),
+                "uploader": clean_text(item.get("author", "")),
+                "tags": [t for t in clean_text(item.get("tag", "")).split(",") if clean_text(t)],
+                "source": "api_search",
+            })
+        return rows
+
+    def _search_videos_via_html(self, keyword: str) -> List[dict]:
+        search_url = BILI_SEARCH_URL_TEMPLATE.format(keyword=quote(keyword))
+        html_text = self._http_get_text(search_url)
+        if "验证码" in html_text and "哔哩哔哩" in html_text:
+            raise RuntimeError("搜索页触发验证码")
+
+        rows: List[dict] = []
+        seen = set()
+        pattern = re.compile(
+            r'<a[^>]+href=["\'](?P<href>(?:https:)?//www\.bilibili\.com/video/(?P<bvid>BV[0-9A-Za-z]+)[^"\']*)["\'][^>]*?(?:title=["\'](?P<title1>.*?)["\'])?[^>]*>(?P<body>.*?)</a>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(html_text):
+            href = clean_text(match.group("href"))
+            if href.startswith("//"):
+                href = "https:" + href
+            bvid = clean_text(match.group("bvid"))
+            title = clean_text(match.group("title1") or match.group("body"))
+            key = bvid or href
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "video_title": title,
+                "video_url": href,
+                "bvid": bvid,
+                "desc": "",
+                "uploader": "",
+                "tags": [],
+                "source": "html_search",
+            })
+        return rows
+
+    def _fetch_video_meta(self, candidate: dict) -> dict:
+        bvid = clean_text(candidate.get("bvid", ""))
+        video_url = clean_text(candidate.get("video_url", ""))
+        title = clean_text(candidate.get("video_title", ""))
+        if not bvid and video_url:
+            m = re.search(r"/video/(BV[0-9A-Za-z]+)", video_url)
+            if m:
+                bvid = m.group(1)
+
+        meta = {
+            "video_title": title,
+            "video_url": video_url,
+            "bvid": bvid,
+            "desc": clean_text(candidate.get("desc", "")),
+            "uploader": clean_text(candidate.get("uploader", "")),
+            "tags": list(candidate.get("tags", []) or []),
+            "source": candidate.get("source", "unknown"),
+        }
+
+        if bvid:
+            try:
+                payload = self._http_get_json(BILI_VIEW_API, params={"bvid": bvid})
+                data = (payload or {}).get("data") or {}
+                meta["video_title"] = clean_text(data.get("title", "")) or meta["video_title"]
+                meta["desc"] = clean_text(data.get("desc", "")) or meta["desc"]
+                owner = data.get("owner") or {}
+                meta["uploader"] = clean_text(owner.get("name", "")) or meta["uploader"]
+                if not meta["video_url"]:
+                    meta["video_url"] = f"https://www.bilibili.com/video/{bvid}"
+                aid = data.get("aid")
+                if aid:
+                    try:
+                        tag_payload = self._http_get_json(BILI_TAG_API, params={"aid": aid})
+                        tag_data = (tag_payload or {}).get("data") or []
+                        tags = [clean_text(x.get("tag_name", "")) for x in tag_data if clean_text(x.get("tag_name", ""))]
+                        if tags:
+                            meta["tags"] = tags
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if meta["video_url"] and (not meta["video_title"] or not meta["tags"]):
+            try:
+                page = self._http_get_text(meta["video_url"])
+                if not meta["video_title"]:
+                    m = re.search(r"<title>(.*?)</title>", page, flags=re.IGNORECASE | re.DOTALL)
+                    if m:
+                        meta["video_title"] = clean_text(m.group(1)).replace("_哔哩哔哩_bilibili", "")
+                if not meta["desc"]:
+                    m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']', page, flags=re.IGNORECASE | re.DOTALL)
+                    if m:
+                        meta["desc"] = clean_text(m.group(1))
+                if not meta["uploader"]:
+                    m = re.search(r'<meta[^>]+name=["\']author["\'][^>]+content=["\'](.*?)["\']', page, flags=re.IGNORECASE | re.DOTALL)
+                    if m:
+                        meta["uploader"] = clean_text(m.group(1))
+                if not meta["tags"]:
+                    m = re.search(r'<meta[^>]+name=["\']keywords["\'][^>]+content=["\'](.*?)["\']', page, flags=re.IGNORECASE | re.DOTALL)
+                    if m:
+                        tags = [clean_text(t) for t in clean_text(m.group(1)).split(",") if clean_text(t)]
+                        tags = [t for t in tags if normalize_title_for_match(t) not in {normalize_title_for_match(meta["video_title"]), ""} and t.lower() not in GENERIC_BILI_TAGS]
+                        if tags:
+                            meta["tags"] = tags[:8]
+            except Exception:
+                pass
+
+        meta["tags"] = [t for t in [clean_text(x) for x in meta["tags"]] if t and t.lower() not in GENERIC_BILI_TAGS]
+        return meta
+
+    def _merge_candidates(self, rows: List[dict]) -> List[dict]:
+        merged: List[dict] = []
+        seen = set()
+        for item in rows:
+            key = clean_text(item.get("bvid", "")) or clean_text(item.get("video_url", "")) or normalize_title_for_match(item.get("video_title", ""))
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        return merged
+
+    def summarize_from_meta(self, title: str, desc: str, tags: List[str], uploader: str = "") -> str:
+        prompt = f"""
+你是一个视频内容摘要助手。
+请根据以下信息生成 30-60 字的简短摘要，仅用于辅助判断搜索结果相关性。
+
+要求：
+1. 只能依据提供的信息，不要脑补。
+2. 输出简洁、客观，不要套话。
+3. 优先概括视频主题、对象、核心内容。
+
+[视频标题]
+{title}
+
+[视频简介]
+{desc}
+
+[视频标签]
+{', '.join(tags)}
+
+[UP主]
+{uploader}
+
+请输出 JSON：{{"summary": "..."}}
+"""
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            data = self._safe_json_loads(resp.choices[0].message.content)
+            return clean_text(data.get("summary", ""))
+        except Exception:
+            parts = [clean_text(title), clean_text(desc)] + [clean_text(t) for t in tags[:3]]
+            parts = [p for p in parts if p]
+            return "；".join(parts)[:80]
+
+    def enrich_summary_from_bilibili_title(self, result_title: str) -> Dict[str, Any]:
+        raw_title = clean_text(result_title)
+        cache_key = normalize_title_for_match(raw_title)
+        if cache_key in self._cache:
+            return dict(self._cache[cache_key])
+
+        search_link = BILI_SEARCH_URL_TEMPLATE.format(keyword=quote(raw_title))
+        keyword_variants = self._keyword_variants(raw_title)
+        routes = []
+        debug_detail = ""
+        all_candidates: List[dict] = []
+
+        for keyword in keyword_variants:
+            try:
+                api_rows = self._search_videos_via_api(keyword)
+                if api_rows:
+                    all_candidates.extend(api_rows)
+                    routes.append(f"api:{keyword}")
+            except Exception as exc:
+                debug_detail += f"api[{keyword}]={exc}; "
+
+            if len(all_candidates) < BILI_CANDIDATE_SCAN_LIMIT:
+                try:
+                    html_rows = self._search_videos_via_html(keyword)
+                    if html_rows:
+                        all_candidates.extend(html_rows)
+                        routes.append(f"html:{keyword}")
+                except Exception as exc:
+                    debug_detail += f"html[{keyword}]={exc}; "
+
+        candidates = self._merge_candidates(all_candidates)
+        target_norm = normalize_title_for_match(raw_title)
+
+        result: Dict[str, Any] = {
+            "matched": False,
+            "summary": "",
+            "search_title": raw_title,
+            "matched_title": "",
+            "video_url": "",
+            "desc": "",
+            "tags": [],
+            "uploader": "",
+            "message": "",
+            "lookup_stage": "search_failed",
+            "debug_detail": debug_detail.strip(),
+            "candidate_titles": [clean_text(x.get("video_title", "")) for x in candidates[:10] if clean_text(x.get("video_title", ""))],
+            "keyword_variants": keyword_variants,
+            "search_route": " | ".join(routes) if routes else "none",
+            "search_link": search_link,
+            "scanned_candidates": min(len(candidates), BILI_CANDIDATE_SCAN_LIMIT),
+        }
+
+        if not candidates:
+            result["lookup_stage"] = "no_candidates"
+            result["message"] = "B站回查失败：未找到任何候选视频。"
+            self._cache[cache_key] = dict(result)
+            return result
+
+        scanned = candidates[:BILI_CANDIDATE_SCAN_LIMIT]
+        exact_match = None
+        for item in scanned:
+            if normalize_title_for_match(item.get("video_title", "")) == target_norm:
+                exact_match = item
+                break
+
+        prefetched_candidates = []
+        for item in scanned[:BILI_PREFETCH_META_LIMIT]:
+            meta = self._fetch_video_meta(item)
+            prefetched_candidates.append(meta)
+            if normalize_title_for_match(meta.get("video_title", "")) == target_norm:
+                exact_match = meta
+                break
+
+        if exact_match is None:
+            result["lookup_stage"] = "title_mismatch"
+            result["candidate_titles"] = [clean_text(x.get("video_title", "")) for x in prefetched_candidates[:10] if clean_text(x.get("video_title", ""))] or result["candidate_titles"]
+            result["message"] = f"B站回查失败：已扫描前 {result['scanned_candidates']} 个候选，仍未命中规范化精确标题。"
+            self._cache[cache_key] = dict(result)
+            return result
+
+        meta = self._fetch_video_meta(exact_match)
+        summary = self.summarize_from_meta(
+            meta.get("video_title", raw_title),
+            meta.get("desc", ""),
+            meta.get("tags", []),
+            meta.get("uploader", ""),
+        )
+
+        result.update({
+            "matched": True,
+            "summary": summary,
+            "matched_title": meta.get("video_title", raw_title),
+            "video_url": meta.get("video_url", ""),
+            "desc": meta.get("desc", ""),
+            "tags": meta.get("tags", []),
+            "uploader": meta.get("uploader", ""),
+            "message": "B站标题回查成功，已自动生成摘要。",
+            "lookup_stage": "completed",
+            "candidate_titles": [clean_text(x.get("video_title", "")) for x in prefetched_candidates[:10] if clean_text(x.get("video_title", ""))] or result["candidate_titles"],
+        })
+        self._cache[cache_key] = dict(result)
+        return result
+
 
 # =========================
 # 🧠 具备 RAG 长期记忆的 Agent 核心类
@@ -74,34 +520,29 @@ def append_to_output(results_list: list):
 class RagSearchEvalAgent:
     def __init__(self, db_path: str):
         self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
-        
-        # 1. 初始化本地向量数据库
         self.chroma_client = chromadb.PersistentClient(path=db_path)
-        # 2. 获取或创建名为 "eval_rules" 的集合（类似于数据库的表）
         self.collection = self.chroma_client.get_or_create_collection(name="eval_rules")
-        print(f"📦 [向量库就绪] 当前知识库已包含 {self.collection.count()} 条人类规则。")
+        self.video_helper = BilibiliVideoSummaryHelper(self.client, MODEL_NAME)
+        print(f"📦 [向量库就绪] 当前知识库已包含 {self.collection.count()} 条规则。")
 
-    # search_rel_eval.py 中的 learn 函数修改
-    def learn(self, query: str, correct_tag: str, human_rule: str, source: str = "Human"):
-        """将规则存入向量库，增加 source 标记 (已确认缩进)"""
-        doc_id = f"rule_{int(time.time() * 1000)}"
-        
-        # 将元数据存入，包含规则来源
+    def learn(self, query: str, correct_tag: str, human_rule: str, source: str = SOURCE_HUMAN):
+        created_at_ms = int(time.time() * 1000)
+        doc_id = f"rule_{uuid.uuid4().hex}"
+        rule_text = normalize_text(human_rule)
         self.collection.add(
-            documents=[query],
+            documents=[f"query: {normalize_text(query)}\nrule: {rule_text}"],
             metadatas=[{
-                "query": query, 
-                "correct_tag": correct_tag, 
-                "human_rule": human_rule,
-                "source": source  # 🤖 AI 或 👤 Human
+                "query": normalize_text(query),
+                "correct_tag": normalize_text(correct_tag),
+                "human_rule": rule_text,
+                "source": normalize_text(source) or SOURCE_HUMAN,
+                "created_at_ms": created_at_ms,
             }],
-            ids=[doc_id]
+            ids=[doc_id],
         )
         print(f"✨ [Agent 顿悟] 规则 ({source}) 已写入记忆库！")
 
     def auto_extract_rule(self, query: str, title: str, summary: str, correct_tag: str, wrong_tag: str) -> str:
-        """AI 自动从人类的纠偏动作中提炼抽象规则"""
-        
         prompt = f"""
 你是一个搜索质量专家。系统最近将一个 Case 判定错了，请根据人类的修正，总结出一条【高度抽象、可迁移】的判定规则。
 
@@ -116,8 +557,8 @@ Query: {query}
 
 # 任务要求：
 1. 解释为什么该 Case 属于 {correct_tag} 而非 {wrong_tag}。
-2. ⚠️ 严禁提及具体的词汇（如“苹果”、“iPhone”）。
-3. 必须使用抽象描述（如“主语品牌平替”、“核心意图偏移”、“修饰词丢失”）。
+2. ⚠️ 严禁提及具体词汇。
+3. 必须使用抽象描述。
 4. 长度控制在 30 字以内。
 
 # 输出格式 (JSON)
@@ -126,42 +567,36 @@ Query: {query}
 }}
 """
         try:
-            # 适当调高温度，增加归纳能力
             res = self._call_llm_with_retry(prompt, temperature=0.5)
             return res.get("abstract_rule", f"识别到{correct_tag}特征，修正原判{wrong_tag}")
-        except:
+        except Exception:
             return f"人类专家强制判定为{correct_tag}"
 
-
+    def enrich_summary_from_bilibili_title(self, result_title: str) -> Dict[str, Any]:
+        return self.video_helper.enrich_summary_from_bilibili_title(result_title)
 
     def _retrieve_relevant_rules(self, query: str, top_k: int = 3) -> List[dict]:
-        """RAG 核心：根据当前的 Query，检索最相似的历史规则"""
-        if self.collection.count() == 0:
+        total = self.collection.count()
+        if total == 0:
             return []
-            
-        # 限制 k 值不能超过数据库里的实际总量
-        k = min(top_k, self.collection.count())
-        
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=k
-        )
-        # 返回检索到的元数据列表
-        return results['metadatas'][0] if results['metadatas'] else []
+        k = min(top_k, total)
+        results = self.collection.query(query_texts=[normalize_text(query)], n_results=k)
+        return results.get("metadatas", [[]])[0] if results.get("metadatas") else []
 
     @staticmethod
     def _safe_json_loads(text: str) -> Dict[str, Any]:
-        try: return json.loads(re.search(r"\{.*\}", text or "", flags=re.DOTALL).group(0))
-        except: return {}
+        try:
+            return json.loads(re.search(r"\{.*\}", text or "", flags=re.DOTALL).group(0))
+        except Exception:
+            return {}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _call_llm_with_retry(self, prompt: str, temperature: float = 0.0) -> dict:
-        # ⚠️ 注意这里新增了 temperature 参数
         resp = self.client.chat.completions.create(
-            model=MODEL_NAME, 
+            model=MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
-            temperature=temperature, # 使用传入的温度
-            response_format={"type": "json_object"}
+            temperature=temperature,
+            response_format={"type": "json_object"},
         )
         return self._safe_json_loads(resp.choices[0].message.content)
 
@@ -175,45 +610,36 @@ Query: {query}
 - "同领域"必须是：用户的核心任务目标完全一致，仅具体对象发生同级替换（包括竞品替换）。
 - "场景衍生"是：宏观领域一致，但用户要解决的问题（任务/动作）发生了偏移。
 
-# 判定大纲与经典判例（请严格作为你的分类标尺！）
+# 判定大纲
 【第一步：宏观领域跨界与多义词排雷】
 1. 判断双方是否属于同一个【超大行业/超大类目】。
-2. 若完全跨界（毫无交集），必须严格区分以下两种情况：
-   - 存在“一词多义”导致的概念偷换（如"苹果"水果变手机，"小米"谷物变数码，"潜伏"动作变电视剧） → 判【query理解有误】
-   - 纯粹的跨界且无核心多义词歧义（如"蔡徐坤"变"原神"，或仅仅是"回家"和"家中"这种无关紧要的字面重合） → 判【完全不相关】
+2. 若完全跨界（毫无交集），必须严格区分：
+   - 存在“一词多义”导致概念偷换 → 判【query理解有误】
+   - 纯粹跨界且无多义词歧义 → 判【完全不相关】
 
 【第二步：核心诉求与实体的二维判断】
-若宏观领域一致，请按以下标准区分两种 1 分泛化：
-- 类别A【推荐同领域内容（平行实体替换）】：
-  定义：用户的【核心动作/诉求】没变，仅仅是【核心实体】被替换成了同分类下的其他兄弟实体（换人、换物、换剧、换竞品）。
-  - 判例1：搜“猫咪吐毛球” → 给“狗狗护理”。（实体：猫变狗。判定：同领域）
-  - 判例2：搜“周杰伦演唱会” → 给“林俊杰演唱会”。（实体：周杰伦变林俊杰。判定：同领域）
-  - 判例3：搜“剪映教程” → 给“PR教程”。（实体：剪映变PR，竞品替换。判定：同领域）
-
-- 类别B【推荐场景衍生内容（诉求/形式偏移）】：
-  定义：【核心实体】可能没变，但用户要做的【核心动作/诉求/形式】发生了明显的偏移。
-  - 判例4：搜“流浪地球2导演” → 给“郭帆作品合集”。（诉求：从找特定人物 变 找作品集。判定：场景衍生）
-  - 判例5：搜“周生如故结局” → 给“周生如故幕后花絮”。（诉求：从看正片 变 看花絮。判定：场景衍生）
-  - 判例6：搜“王者荣耀妲己皮肤” → 给“英雄联盟妲己角色解析”。（诉求：从看外观 变 解析技能。判定：场景衍生）
+若宏观领域一致：
+- 【推荐同领域内容】= 核心动作不变，仅核心实体平行替换。
+- 【推荐场景衍生内容】= 核心实体可能没变，但动作/诉求/形式发生偏移。
 
 【第三步：严苛修饰词丢失检查】
-- 类别C【丢词搜不准（纵向降维）】：
-  定义：主语没变，动作没变，仅仅丢失了修饰该主语的【具体限制词/定语】（如具体年份、具体型号、具体地域）。
-  - 判例7：2024跨年 变 2023跨年。（丢了正确年份。判定：丢词搜不准）
-  - 判例8：婴儿浴巾 变 家用成人浴巾。（丢了“婴儿”限制词。判定：丢词搜不准）
-  🚨 丢词防坑红线：绝对不要把主语（如：Python、护照、电影、主题曲）当成限制词/定语！丢了主语算场景衍生或不相关，绝对不算丢词搜不准。
+- 【丢词搜不准】= 主语没变、动作没变，只丢了修饰主语的具体限制词。
+- 🚨 不要把主语当成限制词；丢了主语绝对不算丢词搜不准。
 """
-        
-        # ==================================================
-        # 🌟 动态 RAG 注入区：只加载最相关的 Top 3 记忆
-        # ==================================================
+
         relevant_memory = self._retrieve_relevant_rules(query, top_k=3)
         memory_section = ""
-        
         if relevant_memory:
-            memory_section = "\n=========================================\n# 💡 高优先级相关经验（由外部向量库召回）\n请高度重视以下人类历史上针对类似 Query 的判定规则：\n"
-            for i, mem in enumerate(relevant_memory):
-                memory_section += f"- 相似历史案例{i+1}: 搜【{mem['query']}】时，适用规则【{mem['human_rule']}】 -> 结论是【{mem['correct_tag']}】\n"
+            memory_section = (
+                "\n=========================================\n"
+                "# 💡 高优先级相关经验（由外部向量库召回）\n"
+                "请高度重视以下历史规则：\n"
+            )
+            for i, mem in enumerate(relevant_memory, start=1):
+                memory_section += (
+                    f"- 相似历史案例{i}: 搜【{mem.get('query', '')}】时，"
+                    f"适用规则【{mem.get('human_rule', '')}】 -> 结论是【{mem.get('correct_tag', '')}】\n"
+                )
 
         tail_prompt = f"""
 =========================================
@@ -235,145 +661,132 @@ Query: {query}
 [Summary]: {summary}
 """
         try:
-            import concurrent.futures
-            from collections import Counter
-            
             final_prompt = base_prompt + memory_section + tail_prompt
             results = []
-            
-            # 开启 3 个线程，对同一个 Case 采样 3 次，温度设为 0.6 增加多样性
-            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-                futures = [executor.submit(self._call_llm_with_retry, final_prompt, 0.6) for _ in range(3)]
-                for future in concurrent.futures.as_completed(futures):
-                    res = future.result()
-                    if "bad_case_tag" in res:
-                        results.append(res)
-            
+            for _ in range(VOTE_SAMPLES):
+                res = self._call_llm_with_retry(final_prompt, temperature=0.6)
+                if "bad_case_tag" in res:
+                    results.append(res)
+
             if not results:
                 return {"bad_case_tag": "Error", "confidence_score": 0, "thought_process": "API全量失败"}
 
-            # --- 统计学一致性投票 ---
             tags = [r.get("bad_case_tag", "Unknown") for r in results]
             tag_counts = Counter(tags)
-            
-            # 找出得票数最多的标签
             most_common_tag, count = tag_counts.most_common(1)[0]
-            
-            # 制定客观置信度
-            if count == 3:
-                confidence = 100  # 3次全一致，极度确信
-            elif count == 2:
-                confidence = 66   # 2:1 分歧，模糊边界
-            else:
-                confidence = 33   # 1:1:1 彻底混乱
-
-            # 提取获胜标签的任意一个思维链
-            final_reason = ""
-            for r in results:
-                if r.get("bad_case_tag") == most_common_tag:
-                    final_reason = r.get("thought_process", "")
-                    break
-                    
-            # 💡 神来之笔：如果出现分歧，把分歧记录追加到理由里给前端看
-            if count < 3:
+            confidence = 100 if count == VOTE_SAMPLES else (66 if count == 2 else 33)
+            final_reason = next((r.get("thought_process", "") for r in results if r.get("bad_case_tag") == most_common_tag), "")
+            if count < VOTE_SAMPLES:
                 final_reason += f"\n\n🚨 [系统提示]：AI 内部产生分歧，投票分布为 {dict(tag_counts)}"
-
             return {
                 "thought_process": final_reason,
                 "bad_case_tag": most_common_tag,
-                "confidence_score": confidence
+                "confidence_score": confidence,
             }
-            
-        except Exception as e:
-            return {"bad_case_tag": "Error", "confidence_score": 0, "thought_process": str(e)}
-            
+        except Exception as exc:
+            return {"bad_case_tag": "Error", "confidence_score": 0, "thought_process": str(exc)}
+
+
 # =========================
 # ⚙️ 并发 Worker 函数
 # =========================
 def process_row(index, row, agent):
-    q = str(row.get("query", ""))
-    t = str(row.get("result_title", ""))
-    s = str(row.get("result_summary", ""))
-    exp_tag = str(row.get("expected_tag", "")).strip().lower()
-    
+    q = normalize_text(row.get("query", ""))
+    t = normalize_text(row.get("result_title", ""))
+    s = normalize_text(row.get("result_summary", ""))
+    exp_tag = normalize_text(row.get("expected_tag", "")).lower()
+
     res = agent.evaluate(q, t, s)
     pred_tag = res.get("bad_case_tag", "Unknown")
-    confidence = res.get("confidence_score", 0)
-    
+    confidence = int(res.get("confidence_score", 0))
+
     return {
-        "index": index, "query": q, "result_title": t, "result_summary": s, "expected_tag": exp_tag,
-        "llm_tag": pred_tag, "llm_reason": res.get("thought_process", ""), "confidence": confidence,
+        "index": index,
+        "case_key": build_case_key(q, t, s),
+        "query": q,
+        "result_title": t,
+        "result_summary": s,
+        "expected_tag": exp_tag,
+        "llm_tag": pred_tag,
+        "llm_reason": res.get("thought_process", ""),
+        "confidence": confidence,
         "is_correct": re.sub(r"\s+", "", pred_tag).lower() == re.sub(r"\s+", "", exp_tag),
-        "needs_intervention": confidence < 95
+        "needs_intervention": confidence < 95,
+        "reviewed": confidence >= 95,
     }
+
 
 # =========================
 # 🏁 主程序
 # =========================
 def main():
-    if not API_KEY: return print("[错误] 未设置 API KEY")
-    df_all = read_csv_with_fallback(INPUT_CSV)
-    
-    processed_queries = get_processed_queries()
-    df_todo = df_all[~df_all['query'].astype(str).isin(processed_queries)].copy()
-    
+    if not API_KEY:
+        print("[错误] 未设置 API KEY")
+        return
+
+    df_all = ensure_case_key(read_csv_with_fallback(INPUT_CSV))
+    processed_case_keys = get_processed_case_keys()
+    df_todo = df_all[~df_all["case_key"].astype(str).isin(processed_case_keys)].copy() if processed_case_keys else df_all.copy()
+
     if df_todo.empty:
-        return print(f"\n🎉 恭喜！{INPUT_CSV} 中的所有数据都已处理完毕。结果在 {OUTPUT_CSV}")
-        
-    print(f"\n{'='*50}")
-    print(f"🚀 V50.0 RAG 架构启动 (剩余 {len(df_todo)} 条待处理)")
-    print(f"{'='*50}")
+        print(f"\n🎉 恭喜！{INPUT_CSV} 中的所有数据都已处理完毕。结果在 {OUTPUT_CSV}")
+        return
+
+    print(f"\n{'=' * 50}")
+    print(f"🚀 RAG 架构启动 (剩余 {len(df_todo)} 条待处理)")
+    print(f"{'=' * 50}")
 
     agent = RagSearchEvalAgent(CHROMA_DB_PATH)
     results_auto = []
-
     start_time = time.time()
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_row, i, r, agent): i for i, r in enumerate(df_todo.to_dict("records"))}
         for future in tqdm(as_completed(futures), total=len(df_todo), desc="机审进度"):
-            res = future.result()
-            results_auto.append(res)
+            results_auto.append(future.result())
 
     high_conf_results = [r for r in results_auto if not r["needs_intervention"]]
     intervention_queue = [r for r in results_auto if r["needs_intervention"]]
-    
+
     if high_conf_results:
         append_to_output(high_conf_results)
 
     print(f"\n✅ RAG 机审阶段完成！耗时: {time.time() - start_time:.2f}s")
     print(f"⚠️ 发现 {len(intervention_queue)} 条低置信度数据，即将进入人工教学...")
     time.sleep(1)
-    
+
     if intervention_queue:
-        print(f"\n{'='*50}\n👨‍🏫 阶段二：集中人工教学 (按 0 随时保存退出)\n{'='*50}")
+        print(f"\n{'=' * 50}\n👨‍🏫 阶段二：集中人工教学 (按 0 随时保存退出)\n{'=' * 50}")
         for item in intervention_queue:
             print(f"\n🔍 Query: 【{item['query']}】")
             print(f"   [Title]: {item['result_title']}")
             print(f"   [Summary]: {item['result_summary']}")
             print(f"   [机器判定]: {item['llm_tag']} (思路: {item['llm_reason']})")
-            
-            print("\n   🎯 [1]完全不相关 [2]丢词搜不准 [3]query理解有误 [4]同领域 [5]衍生 [回车]原判 [0]退出")
+            print("\n   🎯 [1]完全不相关 [2]丢词搜不准 [3]query理解有误 [4]同领域 [5]衍生 [回车]接受原判 [0]退出")
             choice = input(">> 选择: ").strip()
-            
+
             if choice == "0":
                 print("\n👋 保存进度，安全退出！")
                 break
-                
-            elif choice in TAG_DICT:
+
+            if choice in TAG_DICT:
                 human_tag = TAG_DICT[choice]
                 human_rule = input(f">> 已选【{human_tag}】，请输入判别规则: ").strip()
                 if human_rule:
-                    agent.learn(item['query'], human_tag, human_rule)
-                
-                item['llm_tag'] = human_tag
-                item['is_correct'] = re.sub(r"\s+", "", human_tag).lower() == re.sub(r"\s+", "", item['expected_tag']).lower()
+                    agent.learn(item["query"], human_tag, human_rule, source=SOURCE_HUMAN)
+                    item["llm_tag"] = human_tag
+                    item["llm_reason"] = f"【人工纠偏-Human】{human_rule}"
+                    item["confidence"] = 100
+                    item["reviewed"] = True
+                    item["is_correct"] = re.sub(r"\s+", "", human_tag).lower() == re.sub(r"\s+", "", item["expected_tag"]).lower()
 
             append_to_output([item])
             print("-" * 40)
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"✅ 任务完毕！当前向量库容量: {agent.collection.count()} 条经验")
-    print(f"{'='*50}")
+    print(f"{'=' * 50}")
+
 
 if __name__ == "__main__":
     main()
